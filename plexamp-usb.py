@@ -13,6 +13,12 @@ what is missing or invalid.
 Directories can be capped at a user-selected number of audio files to
 accommodate car stereo filesystem limits. A value of -1 disables the limit.
 
+A playlist named "Random" is treated as a special fill mode. When selected,
+tracks are sampled from the complete Plex music library and downloaded until
+the destination filesystem reaches its available-space safety threshold.
+Existing exported tracks are skipped so repeated runs continue filling the
+drive with new music.
+
 Configuration is read from settings.json. No Plex API client library is
 required.
 
@@ -30,6 +36,7 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import socket
@@ -48,6 +55,10 @@ from typing import Iterable
 APP_NAME = "plexamp-usb"
 CONFIG_JSON = "settings.json"
 DOWNLOAD_DIR = "Downloads"
+
+# Leave enough filesystem headroom for metadata, directory entries, and
+# filesystem behavior while V0 output sizes are still being discovered.
+RANDOM_FILL_RESERVE = 128 * 1024 * 1024
 
 DEFAULT_CONFIG = {
     "plex": {
@@ -531,7 +542,6 @@ def discover_gdm_servers(
             if not host:
                 host = address[0]
 
-            # GDM may advertise an address unsuitable for direct LAN use.
             if host.endswith(".plex.direct"):
                 host = address[0]
 
@@ -592,7 +602,6 @@ def prompt_server(
         plex.get("token") or ""
     ).strip()
 
-    # A configured host is authoritative and avoids discovery.
     if configured_host:
         configured = PlexServer(
             name=configured_host,
@@ -663,7 +672,6 @@ def prompt_server(
                 "No Plex server address supplied."
             )
 
-        # Accept http://host or just host.
         parsed = urllib.parse.urlparse(
             host
         )
@@ -747,7 +755,6 @@ def prompt_server(
         f"({server.base_url})"
     )
 
-    # Always try local access without authentication first.
     identity = test_server(
         server,
         timeout,
@@ -768,7 +775,6 @@ def prompt_server(
             protocol=server.protocol,
         )
 
-    # Only ask for a token after unauthenticated access failed.
     print()
     print(
         "  Local access requires authentication."
@@ -894,6 +900,7 @@ def select_music_library(
                 return libraries[
                     index - 1
                 ]
+
         except ValueError:
             pass
 
@@ -994,10 +1001,14 @@ def choose_playlists(
             f"({count:,} tracks, {duration})"
         )
 
-    print()
-    print("  A. ALL playlists")
     print(
-        "  Multiple selections: 1,3,5"
+        "   X. Random Fill Mode"
+    )
+    print(
+        "   A. All"
+    )
+    print(
+        "   Multiple selections: 1,3,5,X"
     )
 
     while True:
@@ -1014,10 +1025,17 @@ def choose_playlists(
 
         try:
             indices: list[int] = []
+            random_selected = False
 
             for part in answer.split(","):
+                part = part.strip()
+
+                if part.lower() == "x":
+                    random_selected = True
+                    continue
+
                 index = int(
-                    part.strip()
+                    part
                 )
 
                 if not 1 <= index <= len(
@@ -1028,16 +1046,26 @@ def choose_playlists(
                 if index not in indices:
                     indices.append(index)
 
-            if not indices:
-                raise ValueError
-
-            return [
+            selected = [
                 (
                     playlists[index - 1][0],
                     playlists[index - 1][1],
                 )
                 for index in indices
             ]
+
+            if random_selected:
+                selected.append(
+                    (
+                        "Random",
+                        "Random",
+                    )
+                )
+
+            if not selected:
+                raise ValueError
+
+            return selected
 
         except ValueError:
             print(
@@ -1140,6 +1168,109 @@ def fetch_playlist_tracks(
                 media_url=media_url,
                 source_size=source_size,
                 playlist_id=playlist_id,
+            )
+        )
+
+    return tracks
+
+
+def fetch_library_tracks(
+    server: PlexServer,
+    library_key: str,
+    timeout: int,
+) -> list[Track]:
+    """Fetch all playable audio tracks from a Plex music library."""
+    root = plex_xml(
+        server,
+        f"/library/sections/{library_key}/all",
+        params={
+            "type": 10,
+        },
+        timeout=timeout,
+    )
+
+    tracks: list[Track] = []
+
+    for item in root.findall(
+        "Track"
+    ):
+        media = item.find("Media")
+
+        if media is None:
+            continue
+
+        part = media.find("Part")
+
+        if part is None:
+            continue
+
+        key = part.attrib.get(
+            "key",
+            "",
+        )
+
+        if not key:
+            continue
+
+        media_url = urllib.parse.urljoin(
+            server.base_url,
+            key,
+        )
+
+        try:
+            source_size = int(
+                part.attrib.get(
+                    "size",
+                    0,
+                )
+            )
+        except ValueError:
+            source_size = 0
+
+        try:
+            duration_ms = int(
+                item.attrib.get(
+                    "duration",
+                    0,
+                )
+            )
+        except ValueError:
+            duration_ms = 0
+
+        tracks.append(
+            Track(
+                rating_key=item.attrib.get(
+                    "ratingKey",
+                    "",
+                ),
+                title=item.attrib.get(
+                    "title",
+                    "Unknown Track",
+                ),
+                artist=item.attrib.get(
+                    "grandparentTitle",
+                    "Unknown Artist",
+                ),
+                album=item.attrib.get(
+                    "parentTitle",
+                    "Unknown Album",
+                ),
+                album_artist=item.attrib.get(
+                    "parentTitle",
+                    "",
+                ),
+                parent_index=item.attrib.get(
+                    "parentIndex",
+                    "1",
+                ),
+                index=item.attrib.get(
+                    "index",
+                    "0",
+                ),
+                duration_ms=duration_ms,
+                media_url=media_url,
+                source_size=source_size,
+                playlist_id="Random",
             )
         )
 
@@ -1355,6 +1486,103 @@ def free_space(
         return 0
 
 
+def random_fill_space_available(
+    output_root: Path,
+) -> bool:
+    """Return whether random fill can safely continue."""
+    return (
+        free_space(output_root)
+        > RANDOM_FILL_RESERVE
+    )
+
+
+def exported_track_keys(
+    output_root: Path,
+) -> set[str]:
+    """Build a set of existing music identities from exported filenames.
+
+    Filename-based matching is intentionally conservative. The Plex rating
+    key is not encoded into car-visible filenames, so artist/title/album are
+    used to prevent obvious repeats across Random runs.
+    """
+    keys: set[str] = set()
+
+    if not output_root.exists():
+        return keys
+
+    for path in output_root.rglob(
+        "*.mp3"
+    ):
+        stem = path.stem
+
+        parts = stem.split(
+            " - ",
+            3,
+        )
+
+        if len(parts) != 4:
+            continue
+
+        _, artist, album, title = parts
+
+        keys.add(
+            "|".join(
+                (
+                    artist.casefold().strip(),
+                    album.casefold().strip(),
+                    title.casefold().strip(),
+                )
+            )
+        )
+
+    return keys
+
+
+def track_identity(
+    track: Track,
+) -> str:
+    """Return a normalized identity for duplicate detection."""
+    return "|".join(
+        (
+            sanitize_filename(
+                track.artist,
+                "",
+            ).casefold(),
+            sanitize_filename(
+                track.album,
+                "",
+            ).casefold(),
+            sanitize_filename(
+                track.title,
+                "",
+            ).casefold(),
+        )
+    )
+
+
+def select_random_tracks(
+    tracks: list[Track],
+    output_root: Path,
+) -> list[Track]:
+    """Randomize the library and remove tracks already exported."""
+    existing = exported_track_keys(
+        output_root
+    )
+
+    candidates = [
+        track
+        for track in tracks
+        if track_identity(track)
+        not in existing
+    ]
+
+    random.SystemRandom().shuffle(
+        candidates
+    )
+
+    return candidates
+
+
 def ffmpeg_command(
     url: str,
     output: Path,
@@ -1520,7 +1748,6 @@ def run_ffmpeg(
             "or incomplete MP3",
         )
 
-    # Validate the complete temporary file before committing it.
     if not file_is_valid(
         part_path
     ):
@@ -1630,8 +1857,6 @@ def download_track(
         if attempt >= retries:
             break
 
-        # Back off independently so parallel workers do not all hammer
-        # Plex again at exactly the same instant.
         delay = min(
             30.0,
             retry_delay
@@ -1834,6 +2059,241 @@ def download_playlist(
     )
 
 
+def download_random_fill(
+    tracks: list[Track],
+    output_root: Path,
+    directory_limit: int,
+    server: PlexServer,
+    retries: int,
+    retry_delay: float,
+    timeout: int,
+) -> tuple[int, int, int]:
+    """Fill the available USB capacity with random new music.
+
+    Tracks are shuffled once and processed in small parallel batches. The
+    batch size is deliberately bounded so a large amount of speculative work
+    is never queued after the filesystem approaches capacity.
+    """
+    candidates = select_random_tracks(
+        tracks,
+        output_root,
+    )
+
+    if not candidates:
+        print()
+        print(
+            "  Random: no new tracks remain."
+        )
+        return 0, 0, 0
+
+    workers = determine_workers()
+
+    print()
+    print("  Random")
+    print("  ──────")
+    print(
+        f"  Library tracks:   {len(tracks):,}"
+    )
+    print(
+        f"  New candidates:   {len(candidates):,}"
+    )
+    print(
+        f"  Parallel:         {workers}"
+    )
+    print(
+        "  Encoding:         MP3 V0 VBR"
+    )
+    print(
+        "  Fill mode:        until drive capacity"
+    )
+    print(
+        f"  Safety reserve:   "
+        f"{human_size(RANDOM_FILL_RESERVE)}"
+    )
+    print()
+
+    downloaded = 0
+    failed = 0
+    written = 0
+
+    # Random gets its own directory so its contents are stable across runs.
+    # Numbering is calculated from the current exported Random tree.
+    random_root = (
+        output_root
+        / playlist_directory("Random")
+    )
+
+    existing_count = sum(
+        1
+        for path in random_root.rglob(
+            "*.mp3"
+        )
+    ) if random_root.exists() else 0
+
+    position = existing_count + 1
+    cursor = 0
+
+    while (
+        cursor < len(candidates)
+        and random_fill_space_available(
+            output_root
+        )
+    ):
+        batch: list[Track] = []
+
+        # Keep enough jobs in flight to use the available CPU without
+        # committing an entire library's worth of output paths.
+        for _ in range(workers):
+            if cursor >= len(candidates):
+                break
+
+            batch.append(
+                candidates[cursor]
+            )
+            cursor += 1
+
+        jobs: list[DownloadJob] = []
+
+        for track in batch:
+            destination = build_output_path(
+                root=output_root,
+                playlist_name="Random",
+                position=position,
+                track=track,
+                directory_limit=directory_limit,
+            )
+
+            jobs.append(
+                DownloadJob(
+                    index=position,
+                    total=0,
+                    track=track,
+                    destination=destination,
+                )
+            )
+
+            position += 1
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="random",
+        ) as executor:
+            futures = [
+                executor.submit(
+                    download_track,
+                    job,
+                    server,
+                    retries,
+                    retry_delay,
+                    timeout,
+                )
+                for job in jobs
+            ]
+
+            for future in concurrent.futures.as_completed(
+                futures
+            ):
+                result = future.result()
+
+                # Random-fill jobs do not have a fixed final total.
+                result = DownloadResult(
+                    job=DownloadJob(
+                        index=result.job.index,
+                        total=0,
+                        track=result.job.track,
+                        destination=result.job.destination,
+                    ),
+                    success=result.success,
+                    skipped=result.skipped,
+                    bytes_written=result.bytes_written,
+                    elapsed=result.elapsed,
+                    attempts=result.attempts,
+                    error=result.error,
+                )
+
+                status = (
+                    "✓"
+                    if result.success
+                    else "✗"
+                )
+
+                rate = (
+                    result.bytes_written
+                    / result.elapsed
+                    if result.elapsed > 0
+                    else 0
+                )
+
+                remaining = free_space(
+                    output_root
+                )
+
+                label = (
+                    f"{result.job.track.artist} - "
+                    f"{result.job.track.title}"
+                )
+
+                print(
+                    f"  [{result.job.index:>4}] "
+                    f"{status} "
+                    f"{compact(label, 55):<55} "
+                    f"{human_size(result.bytes_written):>10} "
+                    f"{human_rate(rate):>12} "
+                    f"{human_size(remaining):>10}"
+                )
+
+                if result.skipped:
+                    print(
+                        "       ↳ already downloaded"
+                    )
+
+                if result.success:
+                    downloaded += 1
+                    written += (
+                        result.bytes_written
+                    )
+                else:
+                    failed += 1
+                    error = compact(
+                        " ".join(
+                            result.error.split()
+                        ),
+                        140,
+                    )
+                    print(
+                        f"       ! {error}"
+                    )
+
+        # Re-evaluate capacity after every batch. This prevents the workers
+        # from starting another batch after the filesystem is effectively full.
+        if not random_fill_space_available(
+            output_root
+        ):
+            break
+
+    remaining = free_space(
+        output_root
+    )
+
+    print()
+    print(
+        f"  Random fill stopped with "
+        f"{human_size(remaining)} remaining."
+    )
+
+    if cursor >= len(candidates):
+        print(
+            "  Random fill exhausted all "
+            "available new library tracks."
+        )
+
+    return (
+        downloaded,
+        failed,
+        written,
+    )
+
+
 def main() -> int:
     """Run the interactive Plex music download workflow."""
     print()
@@ -1865,7 +2325,7 @@ def main() -> int:
             )
         )
 
-        _, section_name = (
+        library_key, section_name = (
             select_music_library(
                 server,
                 timeout,
@@ -1886,7 +2346,6 @@ def main() -> int:
             playlists
         )
 
-        # This deliberately remains the final interactive choice.
         directory_limit = (
             choose_directory_limit()
         )
@@ -1898,8 +2357,6 @@ def main() -> int:
             )
         ).strip() or DOWNLOAD_DIR
 
-        # Keep the USB layout portable by resolving Downloads relative to
-        # the executable script rather than the caller's working directory.
         output_root = (
             Path(__file__).resolve().parent
             / configured_output
@@ -1926,6 +2383,12 @@ def main() -> int:
         )
 
         workers = determine_workers()
+
+        has_random = any(
+            title.casefold().strip()
+            == "random"
+            for _, title in selected
+        )
 
         print()
         print(
@@ -1958,6 +2421,12 @@ def main() -> int:
         print(
             f"  Destination:  {output_root}"
         )
+
+        if has_random:
+            print(
+                "  Random fill:  enabled"
+            )
+
         print()
 
         output_root.mkdir(
@@ -1969,6 +2438,8 @@ def main() -> int:
             tuple[str, list[Track]]
         ] = []
 
+        random_selected = False
+
         print(
             "Collecting music..."
         )
@@ -1978,6 +2449,13 @@ def main() -> int:
             playlist_id,
             playlist_name,
         ) in selected:
+            if (
+                playlist_name.casefold().strip()
+                == "random"
+            ):
+                random_selected = True
+                continue
+
             print(
                 f"  {compact(playlist_name, 60):<60}",
                 end=" ",
@@ -2005,12 +2483,38 @@ def main() -> int:
                 f"{len(tracks):>6,} tracks"
             )
 
+        random_tracks: list[Track] = []
+
+        if random_selected:
+            print(
+                "  Random"
+                f"{'':<54}",
+                end=" ",
+                flush=True,
+            )
+
+            random_tracks = fetch_library_tracks(
+                server,
+                library_key,
+                timeout,
+            )
+
+            random_tracks = unique_tracks(
+                random_tracks
+            )
+
+            print(
+                f"{len(random_tracks):>6,} tracks"
+            )
+
         print()
 
         grand_downloaded = 0
         grand_failed = 0
         grand_written = 0
 
+        # Normal playlists are completed first, preserving the exact
+        # behavior of ordinary playlist downloads.
         for (
             playlist_name,
             tracks,
@@ -2029,6 +2533,27 @@ def main() -> int:
             ) = download_playlist(
                 tracks=tracks,
                 playlist_name=playlist_name,
+                output_root=output_root,
+                directory_limit=directory_limit,
+                server=server,
+                retries=retries,
+                retry_delay=retry_delay,
+                timeout=timeout,
+            )
+
+            grand_downloaded += downloaded
+            grand_failed += failed
+            grand_written += written
+
+        # Random is deliberately last so it consumes only capacity left
+        # after explicitly requested playlists have been exported.
+        if random_selected:
+            (
+                downloaded,
+                failed,
+                written,
+            ) = download_random_fill(
+                tracks=random_tracks,
                 output_root=output_root,
                 directory_limit=directory_limit,
                 server=server,
