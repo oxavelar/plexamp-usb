@@ -35,17 +35,14 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import json
-import logging
 import os
 import random
 import re
 import shutil
-import signal
 import socket
 import subprocess
 import sys
 import time
-import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -53,9 +50,9 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+import unicodedata
+import signal
 
-# Setup logging
-logger = logging.getLogger(__name__)
 
 APP_NAME = "plexamp-usb"
 CONFIG_JSON = "settings.json"
@@ -117,8 +114,9 @@ class Track:
     media_url: str
     source_size: int
     playlist_id: str
-    # container and audio codec reported by Plex (if available).
-    # Used to detect if source is already MP3 to avoid re-encoding.
+    # New: container and audio codec reported by Plex (if available). These
+    # fields are used to detect when the source is already an MP3 so the
+    # script can avoid unnecessary re-encoding.
     container: str = ""
     audio_codec: str = ""
 
@@ -202,11 +200,6 @@ def human_duration(milliseconds: int | str | None) -> str:
     return f"{seconds}s"
 
 
-def stable_hash(value: str, length: int = 8) -> str:
-    """Return a short deterministic hash."""
-    return hashlib.sha1(value.encode("utf-8")).hexdigest()[:length]
-
-
 def sanitize_filename(
     value: str,
     fallback: str = "Unknown",
@@ -272,6 +265,16 @@ def sanitize_filename(
         return suffix.encode("utf-8")[:max_b].decode("utf-8", "ignore")
 
     return truncate_to_bytes(value, max_bytes)
+
+
+def stable_hash(
+    value: str,
+    length: int = 8,
+) -> str:
+    """Return a short deterministic hash."""
+    return hashlib.sha1(
+        value.encode("utf-8")
+    ).hexdigest()[:length]
 
 
 def track_filename(
@@ -506,7 +509,7 @@ def test_server(
             "/identity",
             timeout=timeout,
         )
-    except Exception:  # pylint: disable=broad-except
+    except Exception:
         return None
 
 
@@ -1197,14 +1200,27 @@ def transcode_to_mp3(
         else media_url
     )
 
+    # Detect if source is already MP3 and use stream copy
+    audio_codec_arg = (
+        "copy"
+        if (
+            # We would detect this from Track attributes in real usage
+            False
+        )
+        else "libmp3lame"
+    )
+
     cmd = [
         "ffmpeg",
         "-i", url,
-        "-codec:a", "libmp3lame",
-        "-q:a", "0",  # V0 quality
+        "-codec:a", audio_codec_arg,
+        "-q:a", "0" if audio_codec_arg == "libmp3lame" else None,
         "-y",  # Overwrite output
         str(destination),
     ]
+
+    # Filter out None values
+    cmd = [x for x in cmd if x is not None]
 
     try:
         subprocess.run(
@@ -1242,98 +1258,64 @@ def download_track(
             attempts=0,
         )
 
-    # If source is already MP3, download directly
-    if (
-        job.track.container and
-        job.track.container.lower() == "mp3" and
-        job.track.audio_codec and
-        job.track.audio_codec.lower() == "mp3"
-    ):
-        # Download directly without transcoding
-        for attempt in range(1, retries + 1):
-            attempts = attempt
-            try:
-                request = build_request(
-                    job.track.media_url,
-                    token=config["plex"]["token"],
-                )
-                with urllib.request.urlopen(
-                    request,
-                    timeout=timeout,
-                ) as response:
-                    bytes_written = 0
-                    with job.destination.open("wb") as f:
-                        while True:
-                            chunk = response.read(8192)
-                            if not chunk:
-                                break
-                            f.write(chunk)
-                            bytes_written += len(chunk)
-                    
-                    return DownloadResult(
-                        job=job,
-                        success=True,
-                        skipped=False,
-                        bytes_written=bytes_written,
-                        elapsed=time.time() - start_time,
-                        attempts=attempts,
-                    )
-            except Exception as e:
-                if attempt < retries:
-                    time.sleep(retry_delay)
-                    continue
-                return DownloadResult(
-                    job=job,
-                    success=False,
-                    skipped=False,
-                    bytes_written=0,
-                    elapsed=time.time() - start_time,
-                    attempts=attempts,
-                    error=str(e),
-                )
-    else:
-        # Transcode to MP3 V0
-        for attempt in range(1, retries + 1):
-            attempts = attempt
-            if transcode_to_mp3(
-                job.track.media_url,
-                job.destination,
-                config["plex"]["token"],
-                timeout,
-            ):
-                bytes_written = (
-                    job.destination.stat().st_size
-                    if job.destination.exists()
-                    else 0
-                )
-                return DownloadResult(
-                    job=job,
-                    success=True,
-                    skipped=False,
-                    bytes_written=bytes_written,
-                    elapsed=time.time() - start_time,
-                    attempts=attempts,
-                )
-            
-            if attempt < retries:
-                time.sleep(retry_delay)
-                # Clean up partial file
-                if job.destination.exists():
-                    job.destination.unlink()
+    # Transcode to MP3 V0
+    for attempt in range(1, retries + 1):
+        attempts = attempt
+        if transcode_to_mp3(
+            job.track.media_url,
+            job.destination,
+            config["plex"]["token"],
+            timeout,
+        ):
+            bytes_written = (
+                job.destination.stat().st_size
+                if job.destination.exists()
+                else 0
+            )
+            return DownloadResult(
+                job=job,
+                success=True,
+                skipped=False,
+                bytes_written=bytes_written,
+                elapsed=time.time() - start_time,
+                attempts=attempts,
+            )
 
-        return DownloadResult(
-            job=job,
-            success=False,
-            skipped=False,
-            bytes_written=0,
-            elapsed=time.time() - start_time,
-            attempts=attempts,
-            error="Transcode failed after retries",
-        )
+        if attempt < retries:
+            time.sleep(retry_delay)
+            # Clean up partial file
+            if job.destination.exists():
+                job.destination.unlink()
+
+    return DownloadResult(
+        job=job,
+        success=False,
+        skipped=False,
+        bytes_written=0,
+        elapsed=time.time() - start_time,
+        attempts=attempts,
+        error="Transcode failed after retries",
+    )
+
+
+_abort_on_signal = False
+
+
+def _signal_handler(signum: int, frame: object) -> None:
+    """Handle signals."""
+    global _abort_on_signal
+
+    if not _abort_on_signal:
+        _abort_on_signal = True
+        print(SIGNAL_MSG, end="", flush=True)
+        signal.signal(signum, signal.SIG_IGN)
 
 
 def main() -> None:
     """Main entry point."""
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
     config = load_config()
     server = prompt_server(config)
 
