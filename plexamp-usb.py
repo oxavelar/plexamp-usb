@@ -50,6 +50,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+import unicodedata
 
 
 APP_NAME = "plexamp-usb"
@@ -192,11 +193,26 @@ def human_duration(milliseconds: int | str | None) -> str:
 def sanitize_filename(
     value: str,
     fallback: str = "Unknown",
+    max_bytes: int = 255,
 ) -> str:
-    """Return a filesystem-safe, deterministic filename component."""
-    value = str(value or "").replace("\x00", "")
-    value = value.replace("/", "_").replace("\\", "_")
-    value = re.sub(r"[\x00-\x1f\x7f]", "_", value)
+    """Return a filesystem-safe, deterministic filename component.
+
+    This version normalizes Unicode, strips control characters, replaces
+    characters that are invalid on common USB filesystems (FAT/VFAT/NTFS),
+    and truncates to a maximum number of bytes (UTF-8) while preserving a
+    short stable hash suffix to keep truncated names unique.
+    """
+    value = str(value or "")
+    # Normalize to NFC so visually-equal strings encode identically.
+    value = unicodedata.normalize("NFC", value)
+    value = value.replace("\x00", "")
+
+    # Replace characters that commonly cause problems on FAT/Windows and
+    # also remove other control chars. We allow emoji and other Unicode
+    # characters but forbid :<>\"/\\|?* and control bytes.
+    value = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]', "_", value)
+
+    # Collapse whitespace and trim.
     value = re.sub(r"\s+", " ", value).strip()
     value = value.rstrip(". ")
 
@@ -215,7 +231,30 @@ def sanitize_filename(
     if value.upper() in reserved:
         value = f"_{value}"
 
-    return value
+    # Truncate to max_bytes measured in UTF-8. If truncation is required
+    # append a short stable hash so different long names don't collapse to
+    # the same truncated name.
+    def truncate_to_bytes(s: str, max_b: int) -> str:
+        enc = s.encode("utf-8")
+        if len(enc) <= max_b:
+            return s
+
+        hash_suffix = stable_hash(s, 6)
+        suffix = f"…{hash_suffix}"
+
+        # Reduce s (character by character) until s+suffix fits.
+        # This is simple and safe for UTF-8 because we cut at character
+        # boundaries before encoding.
+        while s:
+            candidate = s + suffix
+            if len(candidate.encode("utf-8")) <= max_b:
+                return candidate
+            s = s[:-1]
+
+        # Fallback: if nothing fits, use truncated suffix.
+        return suffix.encode("utf-8")[:max_b].decode("utf-8", "ignore")
+
+    return truncate_to_bytes(value, max_bytes)
 
 
 def stable_hash(
@@ -232,7 +271,7 @@ def track_filename(
     track: Track,
     number: int,
 ) -> str:
-    """Build a stable car-friendly filename."""
+    """Build a stable car-friendly filename with per-name byte limits."""
     artist = sanitize_filename(
         track.artist,
         "Unknown Artist",
@@ -257,9 +296,31 @@ def track_filename(
         else f"{number:02d}"
     )
 
+    # Build the full filename and ensure it fits into 255 bytes (a common
+    # per-name limit). If it doesn't, shrink the title component so that
+    # the whole name including ".mp3" fits.
+    ext = ".mp3"
+    prefix_part = f"{prefix} - {artist} - {album} - "
+    title_component = title
+
+    max_name_bytes = 255
+    # calculate available bytes for title (in UTF-8)
+    available_for_title = max_name_bytes - len((prefix_part + ext).encode("utf-8"))
+    if available_for_title <= 0:
+        # If artist/album/prefix already exceed the limit (unlikely), truncate
+        # the album instead and fall back to a hash if necessary.
+        album = sanitize_filename(album, "Unknown Album", max_bytes=80)
+        prefix_part = f"{prefix} - {artist} - {album} - "
+        available_for_title = max_name_bytes - len((prefix_part + ext).encode("utf-8"))
+
+    title = sanitize_filename(
+        title_component,
+        "Unknown Track",
+        max_bytes=max(1, available_for_title),
+    )
+
     return (
-        f"{prefix} - {artist} - "
-        f"{album} - {title}.mp3"
+        f"{prefix_part}{title}{ext}"
     )
 
 
