@@ -57,7 +57,6 @@ from typing import Iterable
 # Setup logging
 logger = logging.getLogger(__name__)
 
-# Constants
 APP_NAME = "plexamp-usb"
 CONFIG_JSON = "settings.json"
 DOWNLOAD_DIR = "Downloads"
@@ -208,30 +207,6 @@ def stable_hash(value: str, length: int = 8) -> str:
     return hashlib.sha1(value.encode("utf-8")).hexdigest()[:length]
 
 
-def _truncate_to_bytes(text: str, max_bytes: int) -> str:
-    """Truncate a UTF-8 string to a maximum byte length.
-    
-    Appends a short hash suffix to keep truncated names unique.
-    """
-    encoded = text.encode("utf-8")
-    if len(encoded) <= max_bytes:
-        return text
-
-    hash_suffix = stable_hash(text, 6)
-    suffix = f"…{hash_suffix}"
-
-    # Reduce text (character by character) until text + suffix fits.
-    # This is safe for UTF-8 because we cut at character boundaries.
-    while text:
-        candidate = text + suffix
-        if len(candidate.encode("utf-8")) <= max_bytes:
-            return candidate
-        text = text[:-1]
-
-    # Fallback: if nothing fits, use truncated suffix.
-    return suffix.encode("utf-8")[:max_bytes].decode("utf-8", "ignore")
-
-
 def sanitize_filename(
     value: str,
     fallback: str = "Unknown",
@@ -239,27 +214,29 @@ def sanitize_filename(
 ) -> str:
     """Return a filesystem-safe, deterministic filename component.
 
-    Normalizes Unicode, strips control characters, replaces characters
-    invalid on FAT/VFAT/NTFS, and truncates to max bytes while preserving
-    a hash suffix for uniqueness.
+    This version normalizes Unicode, strips control characters, replaces
+    characters that are invalid on common USB filesystems (FAT/VFAT/NTFS),
+    and truncates to a maximum number of bytes (UTF-8) while preserving a
+    short stable hash suffix to keep truncated names unique.
     """
     value = str(value or "")
     # Normalize to NFC so visually-equal strings encode identically.
     value = unicodedata.normalize("NFC", value)
     value = value.replace("\x00", "")
 
-    # Replace characters problematic on FAT/Windows and control chars.
-    # Allow emoji and Unicode but forbid: :<>"/\|?* and control bytes.
+    # Replace characters that commonly cause problems on FAT/Windows and
+    # also remove other control chars. We allow emoji and other Unicode
+    # characters but forbid :<>\"/\\|?* and control bytes.
     value = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]', "_", value)
 
     # Collapse whitespace and trim.
-    value = re.sub(r"\s+", " ", value).strip().rstrip(". ")
+    value = re.sub(r"\s+", " ", value).strip()
+    value = value.rstrip(". ")
 
     if not value:
         value = fallback
 
-    # Reserve names that are problematic on Windows.
-    reserved_names = {
+    reserved = {
         "CON",
         "PRN",
         "AUX",
@@ -268,17 +245,52 @@ def sanitize_filename(
         *(f"LPT{i}" for i in range(1, 10)),
     }
 
-    if value.upper() in reserved_names:
+    if value.upper() in reserved:
         value = f"_{value}"
 
-    return _truncate_to_bytes(value, max_bytes)
+    # Truncate to max_bytes measured in UTF-8. If truncation is required
+    # append a short stable hash so different long names don't collapse to
+    # the same truncated name.
+    def truncate_to_bytes(s: str, max_b: int) -> str:
+        enc = s.encode("utf-8")
+        if len(enc) <= max_b:
+            return s
+
+        hash_suffix = stable_hash(s, 6)
+        suffix = f"…{hash_suffix}"
+
+        # Reduce s (character by character) until s+suffix fits.
+        # This is simple and safe for UTF-8 because we cut at character
+        # boundaries before encoding.
+        while s:
+            candidate = s + suffix
+            if len(candidate.encode("utf-8")) <= max_b:
+                return candidate
+            s = s[:-1]
+
+        # Fallback: if nothing fits, use truncated suffix.
+        return suffix.encode("utf-8")[:max_b].decode("utf-8", "ignore")
+
+    return truncate_to_bytes(value, max_bytes)
 
 
-def track_filename(track: Track, number: int) -> str:
+def track_filename(
+    track: Track,
+    number: int,
+) -> str:
     """Build a stable car-friendly filename with per-name byte limits."""
-    artist = sanitize_filename(track.artist, "Unknown Artist")
-    album = sanitize_filename(track.album, "Unknown Album")
-    title = sanitize_filename(track.title, "Unknown Track")
+    artist = sanitize_filename(
+        track.artist,
+        "Unknown Artist",
+    )
+    album = sanitize_filename(
+        track.album,
+        "Unknown Album",
+    )
+    title = sanitize_filename(
+        track.title,
+        "Unknown Track",
+    )
 
     try:
         track_number = int(track.index)
@@ -291,33 +303,38 @@ def track_filename(track: Track, number: int) -> str:
         else f"{number:02d}"
     )
 
-    # Build filename ensuring it fits into 255 bytes (common per-name limit).
+    # Build the full filename and ensure it fits into 255 bytes (a common
+    # per-name limit). If it doesn't, shrink the title component so that
+    # the whole name including ".mp3" fits.
     ext = ".mp3"
     prefix_part = f"{prefix} - {artist} - {album} - "
+    title_component = title
 
     max_name_bytes = 255
-    available_for_title = max_name_bytes - len(
-        (prefix_part + ext).encode("utf-8")
-    )
-
+    # calculate available bytes for title (in UTF-8)
+    available_for_title = max_name_bytes - len((prefix_part + ext).encode("utf-8"))
     if available_for_title <= 0:
-        # If artist/album/prefix already exceed limit, truncate album.
+        # If artist/album/prefix already exceed the limit (unlikely), truncate
+        # the album instead and fall back to a hash if necessary.
         album = sanitize_filename(album, "Unknown Album", max_bytes=80)
         prefix_part = f"{prefix} - {artist} - {album} - "
-        available_for_title = max_name_bytes - len(
-            (prefix_part + ext).encode("utf-8")
-        )
+        available_for_title = max_name_bytes - len((prefix_part + ext).encode("utf-8"))
 
     title = sanitize_filename(
-        title,
+        title_component,
         "Unknown Track",
         max_bytes=max(1, available_for_title),
     )
 
-    return f"{prefix_part}{title}{ext}"
+    return (
+        f"{prefix_part}{title}{ext}"
+    )
 
 
-def deep_merge(base: dict, override: dict) -> dict:
+def deep_merge(
+    base: dict,
+    override: dict,
+) -> dict:
     """Recursively merge user configuration over defaults."""
     result = dict(base)
 
@@ -326,7 +343,10 @@ def deep_merge(base: dict, override: dict) -> dict:
             isinstance(result.get(key), dict)
             and isinstance(value, dict)
         ):
-            result[key] = deep_merge(result[key], value)
+            result[key] = deep_merge(
+                result[key],
+                value,
+            )
         else:
             result[key] = value
 
@@ -335,9 +355,15 @@ def deep_merge(base: dict, override: dict) -> dict:
 
 def save_default_config(path: Path) -> None:
     """Write the initial JSON configuration file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    with path.open("w", encoding="utf-8") as handle:
+    with path.open(
+        "w",
+        encoding="utf-8",
+    ) as handle:
         json.dump(
             DEFAULT_CONFIG,
             handle,
@@ -349,25 +375,41 @@ def save_default_config(path: Path) -> None:
 
 def load_config() -> dict:
     """Load settings.json, creating it with defaults when absent."""
-    path = Path(__file__).resolve().parent / CONFIG_JSON
+    path = (
+        Path(__file__).resolve().parent
+        / CONFIG_JSON
+    )
 
     if not path.exists():
         save_default_config(path)
         print(f"  Created {path}")
-        return deep_merge({}, DEFAULT_CONFIG)
+
+        return deep_merge(
+            {},
+            DEFAULT_CONFIG,
+        )
 
     try:
-        with path.open("r", encoding="utf-8") as handle:
+        with path.open(
+            "r",
+            encoding="utf-8",
+        ) as handle:
             loaded = json.load(handle)
     except json.JSONDecodeError as exc:
         raise RuntimeError(
-            f"Invalid JSON in {path}: {exc}"
+            f"Invalid JSON in {path}: "
+            f"{exc}"
         ) from exc
 
     if not isinstance(loaded, dict):
-        raise RuntimeError(f"Invalid configuration: {path}")
+        raise RuntimeError(
+            f"Invalid configuration: {path}"
+        )
 
-    return deep_merge(DEFAULT_CONFIG, loaded)
+    return deep_merge(
+        DEFAULT_CONFIG,
+        loaded,
+    )
 
 
 def build_request(
@@ -384,7 +426,10 @@ def build_request(
     if token:
         headers["X-Plex-Token"] = token
 
-    return urllib.request.Request(url, headers=headers)
+    return urllib.request.Request(
+        url,
+        headers=headers,
+    )
 
 
 def http_get(
@@ -396,10 +441,17 @@ def http_get(
     request = build_request(
         url,
         token=token,
-        accept="application/xml,application/json,text/plain,*/*",
+        accept=(
+            "application/xml,"
+            "application/json,"
+            "text/plain,*/*"
+        ),
     )
 
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urllib.request.urlopen(
+        request,
+        timeout=timeout,
+    ) as response:
         return response.read()
 
 
@@ -410,44 +462,68 @@ def plex_xml(
     timeout: int = 30,
 ) -> ET.Element:
     """Request and parse one Plex XML endpoint."""
-    query = urllib.parse.urlencode(params or {})
+    query = urllib.parse.urlencode(
+        params or {}
+    )
+
     url = f"{server.base_url}{path}"
 
     if query:
         url = f"{url}?{query}"
 
     try:
-        payload = http_get(url, token=server.token, timeout=timeout)
+        payload = http_get(
+            url,
+            token=server.token,
+            timeout=timeout,
+        )
     except urllib.error.HTTPError as exc:
         raise RuntimeError(
-            f"Plex returned HTTP {exc.code} for {path}"
+            f"Plex returned HTTP {exc.code} "
+            f"for {path}"
         ) from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"Unable to reach Plex: {exc.reason}") from exc
+        raise RuntimeError(
+            f"Unable to reach Plex: {exc.reason}"
+        ) from exc
 
     try:
         return ET.fromstring(payload)
     except ET.ParseError as exc:
-        raise RuntimeError(f"Plex returned invalid XML for {path}") from exc
+        raise RuntimeError(
+            f"Plex returned invalid XML for {path}"
+        ) from exc
 
 
-def test_server(server: PlexServer, timeout: int) -> ET.Element | None:
+def test_server(
+    server: PlexServer,
+    timeout: int,
+) -> ET.Element | None:
     """Test Plex connectivity and return identity."""
     try:
-        return plex_xml(server, "/identity", timeout=timeout)
+        return plex_xml(
+            server,
+            "/identity",
+            timeout=timeout,
+        )
     except Exception:  # pylint: disable=broad-except
         return None
 
 
-def discover_gdm_servers(timeout: float = 3.0) -> list[PlexServer]:
-    """Discover Plex Media Servers using Plex GDM protocol."""
-    discovered: dict[tuple[str, int], PlexServer] = {}
+def discover_gdm_servers(
+    timeout: float = 3.0,
+) -> list[PlexServer]:
+    """Discover Plex Media Servers using Plex GDM."""
+    discovered: dict[
+        tuple[str, int],
+        PlexServer,
+    ] = {}
 
     # Plex GDM uses UDP multicast on 239.0.0.250:32414.
     message = (
         b"M-SEARCH * HTTP/1.0\r\n"
         b"HOST: 239.0.0.250:32414\r\n"
-        b'MAN: "ssdp:discover"\r\n'
+        b"MAN: \"ssdp:discover\"\r\n"
         b"ST: plex/media-server\r\n"
         b"\r\n"
     )
@@ -458,18 +534,30 @@ def discover_gdm_servers(timeout: float = 3.0) -> list[PlexServer]:
         socket.IPPROTO_UDP,
     )
 
+    sock.setsockopt(
+        socket.SOL_SOCKET,
+        socket.SO_BROADCAST,
+        1,
+    )
+    sock.settimeout(0.5)
+
     try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.settimeout(0.5)
-
         # Send to the Plex GDM multicast address.
-        sock.sendto(message, ("239.0.0.250", 32414))
+        sock.sendto(
+            message,
+            ("239.0.0.250", 32414),
+        )
 
-        deadline = time.monotonic() + timeout
+        deadline = (
+            time.monotonic()
+            + timeout
+        )
 
         while time.monotonic() < deadline:
             try:
-                data, address = sock.recvfrom(8192)
+                data, address = sock.recvfrom(
+                    8192
+                )
             except socket.timeout:
                 continue
             except OSError:
@@ -478,37 +566,71 @@ def discover_gdm_servers(timeout: float = 3.0) -> list[PlexServer]:
             if not data:
                 continue
 
-            lines = data.decode("utf-8", errors="replace").splitlines()
+            lines = data.decode(
+                "utf-8",
+                errors="replace",
+            ).splitlines()
 
             if not lines:
                 continue
 
-            # Parse response headers.
             headers: dict[str, str] = {}
+
             for line in lines[1:]:
                 if ":" not in line:
                     continue
 
-                key, value = line.split(":", 1)
-                headers[key.strip().lower()] = value.strip()
+                key, value = line.split(
+                    ":",
+                    1,
+                )
 
-            content_type = headers.get("content-type", "").lower()
-            if "plex/media-server" not in content_type:
+                headers[
+                    key.strip().lower()
+                ] = value.strip()
+
+            content_type = headers.get(
+                "content-type",
+                "",
+            ).lower()
+
+            if (
+                "plex/media-server"
+                not in content_type
+            ):
                 continue
 
-            # Extract server details.
-            host = headers.get("host", "").strip()
-            if not host or host.endswith(".plex.direct"):
+            host_header = headers.get(
+                "host",
+                "",
+            ).strip()
+
+            host = host_header
+
+            if not host:
+                host = address[0]
+
+            if host.endswith(".plex.direct"):
                 host = address[0]
 
             try:
-                port = int(headers.get("port", "32400"))
+                port = int(
+                    headers.get(
+                        "port",
+                        "32400",
+                    )
+                )
             except ValueError:
                 port = 32400
 
-            name = headers.get("name", host)
+            name = headers.get(
+                "name",
+                host,
+            )
 
-            discovered[(host, port)] = PlexServer(
+            discovered[
+                (host, port)
+            ] = PlexServer(
                 name=name,
                 host=host,
                 port=port,
@@ -518,18 +640,36 @@ def discover_gdm_servers(timeout: float = 3.0) -> list[PlexServer]:
     finally:
         sock.close()
 
-    return list(discovered.values())
+    return list(
+        discovered.values()
+    )
 
 
-def prompt_server(config: dict) -> PlexServer:
+def prompt_server(
+    config: dict,
+) -> PlexServer:
     """Select a Plex server, preferring local unauthenticated access."""
-    plex_config = config["plex"]
-    timeout = int(plex_config.get("timeout", 30))
-    configured_host = str(plex_config.get("host") or "").strip()
-    configured_port = int(plex_config.get("port") or 32400)
-    configured_token = str(plex_config.get("token") or "").strip()
+    plex = config["plex"]
 
-    # Try configured server first.
+    timeout = int(
+        plex.get(
+            "timeout",
+            30,
+        )
+    )
+
+    configured_host = str(
+        plex.get("host") or ""
+    ).strip()
+
+    configured_port = int(
+        plex.get("port") or 32400
+    )
+
+    configured_token = str(
+        plex.get("token") or ""
+    ).strip()
+
     if configured_host:
         configured = PlexServer(
             name=configured_host,
@@ -538,57 +678,96 @@ def prompt_server(config: dict) -> PlexServer:
             token=configured_token,
         )
 
-        identity = test_server(configured, timeout)
+        identity = test_server(
+            configured,
+            timeout,
+        )
 
         if identity is not None:
-            friendly_name = identity.attrib.get("friendlyName", configured_host)
-            print(f"  Server: {friendly_name}")
-            print(f"  Address: {configured.base_url}")
+            print(
+                f"  Server: {identity.attrib.get(
+                    'friendlyName',
+                    configured_host,
+                )}"
+            )
+            print(
+                f"  Address: {configured.base_url}"
+            )
             print("  Access:  OK")
 
             return PlexServer(
-                name=friendly_name,
+                name=identity.attrib.get(
+                    "friendlyName",
+                    configured_host,
+                ),
                 host=configured_host,
                 port=configured_port,
                 protocol=configured.protocol,
                 token=configured_token,
             )
 
-        print(f"  Configured server unavailable: {configured.base_url}")
+        print(
+            f"  Configured server unavailable: "
+            f"{configured.base_url}"
+        )
 
-    # Discover local servers.
-    print("  Discovering local Plex servers...")
+    print(
+        "  Discovering local Plex servers..."
+    )
+
     servers = discover_gdm_servers()
 
     if not servers:
+        print()
         print(
-            "\n"
-            "  No local Plex server was discovered.\n"
-            "  Enter the Plex server address manually,\n"
-            "  or set plex.host in settings.json.\n"
+            "  No local Plex server was discovered."
         )
+        print()
+        print(
+            "  Enter the Plex server address manually,"
+        )
+        print(
+            "  or set plex.host in settings.json."
+        )
+        print()
 
-        host = input("  Plex server address: ").strip()
+        host = input(
+            "  Plex server address: "
+        ).strip()
+
         if not host:
-            raise RuntimeError("No Plex server address supplied.")
+            raise RuntimeError(
+                "No Plex server address supplied."
+            )
 
-        parsed = urllib.parse.urlparse(host)
+        parsed = urllib.parse.urlparse(
+            host
+        )
 
         if parsed.scheme:
             protocol = parsed.scheme
             host = parsed.hostname or host
-            port = parsed.port or configured_port
+            port = (
+                parsed.port
+                or configured_port
+            )
         else:
             protocol = "http"
-            port = configured_port
 
             if ":" in host:
-                possible_host, possible_port = host.rsplit(":", 1)
+                possible_host, possible_port = (
+                    host.rsplit(":", 1)
+                )
+
                 try:
-                    port = int(possible_port)
+                    port = int(
+                        possible_port
+                    )
                     host = possible_host
                 except ValueError:
-                    pass
+                    port = configured_port
+            else:
+                port = configured_port
 
         servers = [
             PlexServer(
@@ -599,16 +778,26 @@ def prompt_server(config: dict) -> PlexServer:
             )
         ]
 
-    # Select a server.
     if len(servers) == 1:
         server = servers[0]
     else:
-        print("\n  Plex servers:\n")
-        for index, candidate in enumerate(servers, 1):
-            print(f"    {index}. {candidate.name} ({candidate.base_url})")
+        print()
+        print("  Plex servers:")
+
+        for index, candidate in enumerate(
+            servers,
+            1,
+        ):
+            print(
+                f"    {index}. "
+                f"{candidate.name} "
+                f"({candidate.base_url})"
+            )
 
         while True:
-            answer = input("\n  Select Plex server [1]: ").strip()
+            answer = input(
+                "\n  Select Plex server [1]: "
+            ).strip()
 
             if not answer:
                 server = servers[0]
@@ -616,37 +805,61 @@ def prompt_server(config: dict) -> PlexServer:
 
             try:
                 index = int(answer)
+
                 if 1 <= index <= len(servers):
-                    server = servers[index - 1]
+                    server = servers[
+                        index - 1
+                    ]
                     break
             except ValueError:
                 pass
 
-            print("  Invalid selection.")
+            print(
+                "  Invalid selection."
+            )
 
-    print(f"  Found: {server.name} ({server.base_url})")
+    print(
+        f"  Found: {server.name} "
+        f"({server.base_url})"
+    )
 
-    identity = test_server(server, timeout)
+    identity = test_server(
+        server,
+        timeout,
+    )
 
     if identity is not None:
-        print("  Local access: OK")
+        print(
+            "  Local access: OK"
+        )
+
         return PlexServer(
-            name=identity.attrib.get("friendlyName", server.name),
+            name=identity.attrib.get(
+                "friendlyName",
+                server.name,
+            ),
             host=server.host,
             port=server.port,
             protocol=server.protocol,
         )
 
-    # Local access failed; try with token.
-    print("\n  Local access requires authentication.\n")
+    print()
+    print(
+        "  Local access requires authentication."
+    )
 
     token = configured_token
 
     if not token:
-        token = input("  Plex token: ").strip()
+        token = input(
+            "  Plex token: "
+        ).strip()
 
     if not token:
-        raise RuntimeError("A Plex token is required for this server.")
+        raise RuntimeError(
+            "A Plex token is required "
+            "for this server."
+        )
 
     authenticated = PlexServer(
         name=server.name,
@@ -656,17 +869,26 @@ def prompt_server(config: dict) -> PlexServer:
         token=token,
     )
 
-    identity = test_server(authenticated, timeout)
+    identity = test_server(
+        authenticated,
+        timeout,
+    )
 
     if identity is None:
         raise RuntimeError(
-            "Unable to connect to Plex with the supplied token."
+            "Unable to connect to Plex "
+            "with the supplied token."
         )
 
-    print("  Authentication: OK")
+    print(
+        "  Authentication: OK"
+    )
 
     return PlexServer(
-        name=identity.attrib.get("friendlyName", server.name),
+        name=identity.attrib.get(
+            "friendlyName",
+            server.name,
+        ),
         host=server.host,
         port=server.port,
         protocol=server.protocol,
@@ -685,31 +907,56 @@ def select_music_library(
         timeout=timeout,
     )
 
-    libraries: list[tuple[str, str]] = []
+    libraries: list[
+        tuple[str, str]
+    ] = []
 
-    for directory in root.findall("Directory"):
-        if directory.attrib.get("type") != "artist":
+    for directory in root.findall(
+        "Directory"
+    ):
+        if directory.attrib.get(
+            "type"
+        ) != "artist":
             continue
 
-        key = directory.attrib.get("key", "")
-        title = directory.attrib.get("title", "Music")
+        key = directory.attrib.get(
+            "key",
+            "",
+        )
+        title = directory.attrib.get(
+            "title",
+            "Music",
+        )
 
         if key:
-            libraries.append((key, title))
+            libraries.append(
+                (key, title)
+            )
 
     if not libraries:
-        raise RuntimeError("No Plex music library was found.")
+        raise RuntimeError(
+            "No Plex music library was found."
+        )
 
     if len(libraries) == 1:
         return libraries[0]
 
-    print("\nMusic libraries:\n")
+    print()
+    print("Music libraries:")
+    print()
 
-    for index, (_, title) in enumerate(libraries, 1):
-        print(f"  {index:>2}. {title}")
+    for index, (_, title) in enumerate(
+        libraries,
+        1,
+    ):
+        print(
+            f"  {index:>2}. {title}"
+        )
 
     while True:
-        answer = input("\nSelect music library [1]: ").strip()
+        answer = input(
+            "\nSelect music library [1]: "
+        ).strip()
 
         if not answer:
             return libraries[0]
@@ -718,45 +965,491 @@ def select_music_library(
             index = int(answer)
 
             if 1 <= index <= len(libraries):
-                return libraries[index - 1]
+                return libraries[
+                    index - 1
+                ]
 
         except ValueError:
             pass
 
-        print("Invalid selection.")
+        print(
+            "Invalid selection."
+        )
 
 
 def get_playlists(
     server: PlexServer,
     timeout: int,
-) -> list[tuple[str, str, int, str]]:
+) -> list[
+    tuple[str, str, int, str]
+]:
     """Return audio playlists available from Plex."""
     root = plex_xml(
         server,
         "/playlists",
-        params={"playlistType": "audio"},
+        params={
+            "playlistType": "audio"
+        },
         timeout=timeout,
     )
 
     playlists = []
 
-    for playlist in root.findall("Playlist"):
-        rating_key = playlist.attrib.get("ratingKey", "")
+    for playlist in root.findall(
+        "Playlist"
+    ):
+        rating_key = playlist.attrib.get(
+            "ratingKey",
+            "",
+        )
 
-        title = playlist.attrib.get("title", "Unnamed")
+        title = playlist.attrib.get(
+            "title",
+            "Unnamed",
+        )
 
         if not rating_key:
             continue
 
         try:
-            count = int(playlist.attrib.get("leafCount", 0))
+            count = int(
+                playlist.attrib.get(
+                    "leafCount",
+                    0,
+                )
+            )
         except ValueError:
             count = 0
 
-        duration = human_duration(playlist.attrib.get("duration"))
+        duration = human_duration(
+            playlist.attrib.get(
+                "duration"
+            )
+        )
 
-        playlists.append((rating_key, title, count, duration))
+        playlists.append(
+            (
+                rating_key,
+                title,
+                count,
+                duration,
+            )
+        )
 
     return playlists
 
-# ... rest of file unchanged ...
+
+def get_playlist_items(
+    server: PlexServer,
+    rating_key: str,
+    timeout: int,
+) -> list[Track]:
+    """Get all tracks from a Plex playlist."""
+    root = plex_xml(
+        server,
+        f"/playlists/{rating_key}/items",
+        timeout=timeout,
+    )
+
+    tracks = []
+
+    for track in root.findall("Track"):
+        rating_key = track.attrib.get("ratingKey", "")
+        title = track.attrib.get("title", "Unknown")
+        artist = track.attrib.get("grandparentTitle", "Unknown Artist")
+        album = track.attrib.get("parentTitle", "Unknown Album")
+        album_artist = track.attrib.get("grandparentTitle", "Unknown Artist")
+        parent_index = track.attrib.get("parentIndex", "0")
+        index = track.attrib.get("index", "0")
+        container = track.attrib.get("container", "")
+        audio_codec = track.attrib.get("audioCodec", "")
+
+        try:
+            duration_ms = int(track.attrib.get("duration", "0"))
+        except ValueError:
+            duration_ms = 0
+
+        try:
+            source_size = int(track.attrib.get("size", "0"))
+        except ValueError:
+            source_size = 0
+
+        media = track.find("Media")
+        if media is None:
+            continue
+
+        part = media.find("Part")
+        if part is None:
+            continue
+
+        media_url = f"{server.base_url}{part.attrib.get('key', '')}"
+
+        if not rating_key:
+            continue
+
+        tracks.append(
+            Track(
+                rating_key=rating_key,
+                title=title,
+                artist=artist,
+                album=album,
+                album_artist=album_artist,
+                parent_index=parent_index,
+                index=index,
+                duration_ms=duration_ms,
+                media_url=media_url,
+                source_size=source_size,
+                playlist_id=rating_key,
+                container=container,
+                audio_codec=audio_codec,
+            )
+        )
+
+    return tracks
+
+
+def get_library_items(
+    server: PlexServer,
+    library_key: str,
+    timeout: int,
+    limit: int | None = None,
+) -> list[Track]:
+    """Get all tracks from a Plex library."""
+    root = plex_xml(
+        server,
+        f"/library/sections/{library_key}/all",
+        params={
+            "type": 10,  # Track
+            "limit": limit or 9999,
+        },
+        timeout=timeout,
+    )
+
+    tracks = []
+
+    for track in root.findall("Track"):
+        rating_key = track.attrib.get("ratingKey", "")
+        title = track.attrib.get("title", "Unknown")
+        artist = track.attrib.get("grandparentTitle", "Unknown Artist")
+        album = track.attrib.get("parentTitle", "Unknown Album")
+        album_artist = track.attrib.get("grandparentTitle", "Unknown Artist")
+        parent_index = track.attrib.get("parentIndex", "0")
+        index = track.attrib.get("index", "0")
+        container = track.attrib.get("container", "")
+        audio_codec = track.attrib.get("audioCodec", "")
+
+        try:
+            duration_ms = int(track.attrib.get("duration", "0"))
+        except ValueError:
+            duration_ms = 0
+
+        try:
+            source_size = int(track.attrib.get("size", "0"))
+        except ValueError:
+            source_size = 0
+
+        media = track.find("Media")
+        if media is None:
+            continue
+
+        part = media.find("Part")
+        if part is None:
+            continue
+
+        media_url = f"{server.base_url}{part.attrib.get('key', '')}"
+
+        if not rating_key:
+            continue
+
+        tracks.append(
+            Track(
+                rating_key=rating_key,
+                title=title,
+                artist=artist,
+                album=album,
+                album_artist=album_artist,
+                parent_index=parent_index,
+                index=index,
+                duration_ms=duration_ms,
+                media_url=media_url,
+                source_size=source_size,
+                playlist_id=library_key,
+                container=container,
+                audio_codec=audio_codec,
+            )
+        )
+
+    return tracks
+
+
+def transcode_to_mp3(
+    media_url: str,
+    destination: Path,
+    server_token: str,
+    timeout: int = 120,
+) -> bool:
+    """Transcode media to MP3 V0 using ffmpeg."""
+    # Add token to URL if present
+    separator = "&" if "?" in media_url else "?"
+    url = (
+        f"{media_url}{separator}X-Plex-Token={server_token}"
+        if server_token
+        else media_url
+    )
+
+    cmd = [
+        "ffmpeg",
+        "-i", url,
+        "-codec:a", "libmp3lame",
+        "-q:a", "0",  # V0 quality
+        "-y",  # Overwrite output
+        str(destination),
+    ]
+
+    try:
+        subprocess.run(
+            cmd,
+            timeout=timeout,
+            capture_output=True,
+            check=True,
+        )
+        return True
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+        return False
+
+
+def download_track(
+    job: DownloadJob,
+    config: dict,
+    timeout: int,
+) -> DownloadResult:
+    """Download and transcode one track."""
+    start_time = time.time()
+    attempts = 0
+    retries = config["download"]["retries"]
+    retry_delay = config["download"]["retry_delay"]
+
+    job.destination.parent.mkdir(parents=True, exist_ok=True)
+
+    # Check if file already exists and is valid
+    if job.destination.exists():
+        return DownloadResult(
+            job=job,
+            success=True,
+            skipped=True,
+            bytes_written=0,
+            elapsed=time.time() - start_time,
+            attempts=0,
+        )
+
+    # If source is already MP3, download directly
+    if (
+        job.track.container and
+        job.track.container.lower() == "mp3" and
+        job.track.audio_codec and
+        job.track.audio_codec.lower() == "mp3"
+    ):
+        # Download directly without transcoding
+        for attempt in range(1, retries + 1):
+            attempts = attempt
+            try:
+                request = build_request(
+                    job.track.media_url,
+                    token=config["plex"]["token"],
+                )
+                with urllib.request.urlopen(
+                    request,
+                    timeout=timeout,
+                ) as response:
+                    bytes_written = 0
+                    with job.destination.open("wb") as f:
+                        while True:
+                            chunk = response.read(8192)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            bytes_written += len(chunk)
+                    
+                    return DownloadResult(
+                        job=job,
+                        success=True,
+                        skipped=False,
+                        bytes_written=bytes_written,
+                        elapsed=time.time() - start_time,
+                        attempts=attempts,
+                    )
+            except Exception as e:
+                if attempt < retries:
+                    time.sleep(retry_delay)
+                    continue
+                return DownloadResult(
+                    job=job,
+                    success=False,
+                    skipped=False,
+                    bytes_written=0,
+                    elapsed=time.time() - start_time,
+                    attempts=attempts,
+                    error=str(e),
+                )
+    else:
+        # Transcode to MP3 V0
+        for attempt in range(1, retries + 1):
+            attempts = attempt
+            if transcode_to_mp3(
+                job.track.media_url,
+                job.destination,
+                config["plex"]["token"],
+                timeout,
+            ):
+                bytes_written = (
+                    job.destination.stat().st_size
+                    if job.destination.exists()
+                    else 0
+                )
+                return DownloadResult(
+                    job=job,
+                    success=True,
+                    skipped=False,
+                    bytes_written=bytes_written,
+                    elapsed=time.time() - start_time,
+                    attempts=attempts,
+                )
+            
+            if attempt < retries:
+                time.sleep(retry_delay)
+                # Clean up partial file
+                if job.destination.exists():
+                    job.destination.unlink()
+
+        return DownloadResult(
+            job=job,
+            success=False,
+            skipped=False,
+            bytes_written=0,
+            elapsed=time.time() - start_time,
+            attempts=attempts,
+            error="Transcode failed after retries",
+        )
+
+
+def main() -> None:
+    """Main entry point."""
+    config = load_config()
+    server = prompt_server(config)
+
+    print()
+    library_key, library_name = select_music_library(
+        server,
+        config["plex"]["timeout"],
+    )
+
+    print()
+    playlists = get_playlists(
+        server,
+        config["plex"]["timeout"],
+    )
+
+    if not playlists:
+        print("No playlists available.")
+        return
+
+    print("Available playlists:")
+    print()
+
+    for index, (rating_key, title, count, duration) in enumerate(playlists, 1):
+        print(f"  {index:>2}. {title:30} ({count:3} tracks, {duration})")
+
+    print()
+
+    while True:
+        answer = input("Select playlist [1]: ").strip()
+
+        if not answer:
+            playlist_index = 0
+            break
+
+        try:
+            playlist_index = int(answer) - 1
+            if 0 <= playlist_index < len(playlists):
+                break
+        except ValueError:
+            pass
+
+        print("Invalid selection.")
+
+    rating_key, title, count, duration = playlists[playlist_index]
+
+    print()
+    print(f"Downloading: {title}")
+    print()
+
+    # Get tracks
+    if title.lower() == "random":
+        # Get random sample from library
+        tracks = get_library_items(
+            server,
+            library_key,
+            config["plex"]["timeout"],
+        )
+        random.shuffle(tracks)
+    else:
+        # Get playlist tracks
+        tracks = get_playlist_items(
+            server,
+            rating_key,
+            config["plex"]["timeout"],
+        )
+
+    download_dir = (
+        Path(__file__).resolve().parent
+        / config["output"]["directory"]
+        / sanitize_filename(title)
+    )
+
+    # Create download jobs
+    jobs: list[DownloadJob] = []
+    for index, track in enumerate(tracks, 1):
+        filename = track_filename(track, index)
+        destination = download_dir / filename
+        jobs.append(
+            DownloadJob(
+                index=index,
+                total=len(tracks),
+                track=track,
+                destination=destination,
+            )
+        )
+
+    # Download tracks
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(download_track, job, config, config["plex"]["timeout"])
+            for job in jobs
+        ]
+
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            status = "✓" if result.success else "✗"
+            skipped_text = " (cached)" if result.skipped else ""
+            print(
+                f"[{result.job.index:3}/{result.job.total}] {status} "
+                f"{compact(result.job.track.title, 40)} "
+                f"{human_size(result.bytes_written):>10} "
+                f"{human_rate(result.bytes_written / result.elapsed):>12}"
+                f"{skipped_text}"
+            )
+
+    print()
+    print("Download complete.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
+        print("Interrupted.")
+        sys.exit(1)
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
