@@ -109,6 +109,11 @@ class Track:
     media_url: str
     source_size: int
     playlist_id: str
+    # New: container and audio codec reported by Plex (if available). These
+    # fields are used to detect when the source is already an MP3 so the
+    # script can avoid unnecessary re-encoding.
+    container: str = ""
+    audio_codec: str = ""
 
 
 @dataclass(frozen=True)
@@ -1229,6 +1234,8 @@ def fetch_playlist_tracks(
                 media_url=media_url,
                 source_size=source_size,
                 playlist_id=playlist_id,
+                container=part.attrib.get("container", ""),
+                audio_codec=part.attrib.get("audioCodec", ""),
             )
         )
 
@@ -1332,6 +1339,8 @@ def fetch_library_tracks(
                 media_url=media_url,
                 source_size=source_size,
                 playlist_id="Random",
+                container=part.attrib.get("container", ""),
+                audio_codec=part.attrib.get("audioCodec", ""),
             )
         )
 
@@ -1648,8 +1657,14 @@ def ffmpeg_command(
     url: str,
     output: Path,
     token: str,
+    copy: bool = False,
 ) -> list[str]:
-    """Build the retry-safe FFmpeg MP3 V0 command."""
+    """Build the retry-safe FFmpeg command.
+
+    If copy is True the audio stream is copied ("-c:a copy") instead of
+    being re-encoded. This allows skipping re-encoding when the source is
+    already MP3.
+    """
     command = [
         "ffmpeg",
         "-hide_banner",
@@ -1688,20 +1703,36 @@ def ffmpeg_command(
             "0:a:0",
             "-map_metadata",
             "0",
+        ]
+    )
 
-            # LAME V0 is the highest-quality VBR preset.
+    if copy:
+        # Use stream copy when the source is already MP3. Select the mp3 muxer
+        # explicitly since destination file ends in .mp3 and we want a proper
+        # container.
+        command.extend([
             "-c:a",
-            "libmp3lame",
-            "-q:a",
-            "0",
-
-            # .mp3.part has no recognizable container extension, so the
-            # muxer must be selected explicitly.
+            "copy",
             "-f",
             "mp3",
             str(output),
-        ]
-    )
+        ])
+    else:
+        # LAME V0 is the highest-quality VBR preset.
+        command.extend(
+            [
+                "-c:a",
+                "libmp3lame",
+                "-q:a",
+                "0",
+
+                # .mp3.part has no recognizable container extension, so the
+                # muxer must be selected explicitly.
+                "-f",
+                "mp3",
+                str(output),
+            ]
+        )
 
     return command
 
@@ -1711,8 +1742,14 @@ def run_ffmpeg(
     destination: Path,
     token: str,
     timeout: int,
+    copy: bool = False,
 ) -> tuple[bool, int, str]:
-    """Transfer one track into an atomic temporary file."""
+    """Transfer one track into an atomic temporary file.
+
+    copy=True will instruct ffmpeg to stream-copy the audio stream rather
+    than re-encode it. The rest of the logic (temporary .part files and
+    validation) is unchanged.
+    """
     destination.parent.mkdir(
         parents=True,
         exist_ok=True,
@@ -1733,6 +1770,7 @@ def run_ffmpeg(
         url=url,
         output=part_path,
         token=token,
+        copy=copy,
     )
 
     try:
@@ -1889,6 +1927,15 @@ def download_track(
     started = time.monotonic()
     last_error = "unknown error"
 
+    # Decide whether we can avoid re-encoding. Prefer Plex-reported container
+    # / codec attributes but also fall back to checking the URL extension.
+    track = job.track
+    source_is_mp3 = (
+        (track.container or "").lower() == "mp3"
+        or (track.audio_codec or "").lower() == "mp3"
+        or (track.media_url or "").lower().endswith(".mp3")
+    )
+
     for attempt in range(
         1,
         retries + 1,
@@ -1898,6 +1945,7 @@ def download_track(
             destination=destination,
             token=server.token,
             timeout=timeout,
+            copy=source_is_mp3,
         )
 
         if success:
