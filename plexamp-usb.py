@@ -80,7 +80,7 @@ DEFAULT_CONFIG = {
         "directory_limit": 255,
     },
     "download": {
-        "retries": 10,
+        "retries": 3,
         "retry_delay": 2.0,
     },
 }
@@ -1021,7 +1021,8 @@ def download_track(job: DownloadJob, server: PlexServer, retries: int, retry_del
         if attempt >= retries:
             break
 
-        delay = min(30.0, retry_delay * (2 ** (attempt - 1))) + (job.index % 7) * 0.15
+        scale_factor = retry_delay / (2 ** (retries - 1)) if retries > 0 else retry_delay
+        delay = min(retry_delay, scale_factor * (2 ** (attempt - 1))) + (job.index % 7) * 0.15
         time.sleep(delay)
 
     return DownloadResult(job=job, success=False, skipped=False, bytes_written=0, elapsed=(time.monotonic() - started), attempts=retries, error=last_error)
@@ -1253,7 +1254,7 @@ def main() -> int:
         if directory_limit == 0 or directory_limit < -1:
             directory_limit = choose_directory_limit()
 
-        retries = max(1, safe_int(config["download"].get("retries"), 10))
+        retries = max(1, safe_int(config["download"].get("retries"), 3))
         retry_delay = max(0.1, float(config["download"].get("retry_delay", 2.0)))
         workers = conversion_threads(config)
         output_format, quality = conversion_spec(config)
