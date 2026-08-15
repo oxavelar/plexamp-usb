@@ -626,6 +626,15 @@ def choose_playlists(playlists: list[tuple[str, str, int, str]], output_root: Pa
             print("Invalid selection.")
 
 
+def safe_media_url(base_url: str, key: str) -> str:
+    """Safely construct and quote media URLs containing unicode/special characters."""
+    joined = urllib.parse.urljoin(base_url, key)
+    parsed = urllib.parse.urlparse(joined)
+    path = urllib.parse.quote(parsed.path, safe="/%")
+    query = urllib.parse.quote(parsed.query, safe="=&?%")
+    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, path, parsed.params, query, parsed.fragment))
+
+
 def track_from_xml(item: ET.Element, server: PlexServer, playlist_id: str) -> Track | None:
     media = item.find("Media")
     if media is None or (part := media.find("Part")) is None:
@@ -643,7 +652,7 @@ def track_from_xml(item: ET.Element, server: PlexServer, playlist_id: str) -> Tr
         parent_index=item.attrib.get("parentIndex", "1"),
         index=item.attrib.get("index", "0"),
         duration_ms=safe_int(item.attrib.get("duration")),
-        media_url=urllib.parse.urljoin(server.base_url, key),
+        media_url=safe_media_url(server.base_url, key),
         source_size=safe_int(part.attrib.get("size")),
         playlist_id=playlist_id,
         container=part.attrib.get("container", media.attrib.get("container", "")),
@@ -1053,11 +1062,18 @@ def print_result(result: DownloadResult, output_root: Path) -> None:
     rate = result.bytes_written / result.elapsed if result.elapsed > 0 else 0
     remaining = free_space(output_root)
     label = f"{result.job.track.artist} - {result.job.track.title}"
-    total = str(result.job.total) if result.job.total else "?"
+    
+    if result.job.total:
+        prefix = f"  [{result.job.index:>4}/{result.job.total:<4}] {status} "
+    else:
+        index_str = str(result.job.index)
+        padding = max(0, 9 - len(index_str))
+        left = padding // 2
+        right = padding - left
+        centered_index = f"{' ' * left}{index_str}{' ' * right}"
+        prefix = f"  [{centered_index}] {status} "
 
-    prefix = f"  [{result.job.index:>4}/{total:<4}] {status} "
     rate_str = "" if result.skipped else human_rate(rate)
-
     suffix = f" {human_size(result.bytes_written):>10} {rate_str:>12} {human_size(remaining):>10}"
 
     terminal_width = shutil.get_terminal_size(fallback=(80, 20)).columns
@@ -1097,7 +1113,7 @@ def download_jobs(
     output_format: str,
     quality: str,
 ) -> tuple[int, int, int]:
-    """Process download queue using dynamic adaptive concurrency with instant Ctrl+C handling."""
+    """Process download queue using dynamic adaptive concurrency that scales down automatically on turbulence."""
     downloaded, failed, written = 0, 0, 0
     interrupted = False
     adaptive = AdaptiveConcurrency(max_workers)
@@ -1149,7 +1165,10 @@ def download_jobs(
                         downloaded += 1
                         written += result.bytes_written
                         if not result.skipped:
-                            adaptive.success()
+                            if result.attempts <= 1:
+                                adaptive.success()
+                            else:
+                                adaptive.failure()
                     else:
                         failed += 1
                         adaptive.failure()
