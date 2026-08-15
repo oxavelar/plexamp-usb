@@ -30,6 +30,8 @@ Requirements:
     - ffmpeg and ffprobe when conversion is required
 """
 
+from __platform__ import annotations  # type: ignore
+
 from __future__ import annotations
 
 import concurrent.futures
@@ -58,7 +60,6 @@ APP_NAME = "plexamp-usb"
 CONFIG_JSON = "settings.json"
 DOWNLOAD_DIR = "Downloads"
 
-RANDOM_FILL_RESERVE = 128 * 1024 * 1024
 DURATION_TOLERANCE_SECONDS = 2.0
 
 ADAPTIVE_SUCCESS_THRESHOLD = 8
@@ -84,6 +85,9 @@ DEFAULT_CONFIG = {
         "retry_delay": 2.0,
     },
 }
+
+_RANDOM_INITIAL_FREE = 0
+_RANDOM_TARGET_FILL = 0
 
 
 @dataclass(frozen=True)
@@ -788,7 +792,12 @@ def free_space(path: Path) -> int:
 
 
 def random_fill_space_available(output_root: Path) -> bool:
-    return free_space(output_root) > RANDOM_FILL_RESERVE
+    try:
+        usage = shutil.disk_usage(output_root)
+        reserve = usage.total // 100
+        return usage.free > reserve
+    except OSError:
+        return False
 
 
 def track_identity(track: Track) -> str:
@@ -1057,23 +1066,8 @@ def download_track(job: DownloadJob, server: PlexServer, retries: int, retry_del
     return DownloadResult(job=job, success=False, skipped=False, bytes_written=0, elapsed=(time.monotonic() - started), attempts=retries, error=last_error)
 
 
-def get_average_track_size(random_root: Path) -> int:
-    if not random_root.exists():
-        return 7 * 1024 * 1024  # Default assumption ~7 MB per V0 MP3 track
-    total_size = 0
-    count = 0
-    for path in random_root.rglob("*.mp3"):
-        try:
-            total_size += path.stat().st_size
-            count += 1
-        except OSError:
-            continue
-    if count > 0 and total_size > 0:
-        return int(total_size / count)
-    return 7 * 1024 * 1024
-
-
 def print_result(result: DownloadResult, output_root: Path) -> None:
+    global _RANDOM_INITIAL_FREE, _RANDOM_TARGET_FILL
     status = "-" if result.skipped else ("✓" if result.success else "✗")
     rate = result.bytes_written / result.elapsed if result.elapsed > 0 else 0
     remaining = free_space(output_root)
@@ -1082,14 +1076,15 @@ def print_result(result: DownloadResult, output_root: Path) -> None:
     if result.job.total:
         prefix = f"  [{result.job.index:>4}/{result.job.total:<4}] {status} "
     else:
-        random_root = output_root / playlist_directory("Random")
-        avg_size = get_average_track_size(random_root)
-        rem_space = free_space(output_root) - RANDOM_FILL_RESERVE
-        rem_tracks = max(0, int(rem_space / avg_size)) if avg_size > 0 else 0
-        est_total = result.job.index + rem_tracks
+        if _RANDOM_TARGET_FILL > 0:
+            current_free = free_space(output_root)
+            filled_bytes = max(0, _RANDOM_INITIAL_FREE - current_free)
+            pct = min(100.0, (filled_bytes / _RANDOM_TARGET_FILL) * 100.0)
+        else:
+            pct = 100.0
         
-        est_label = f"~{est_total}"
-        prefix = f"  [{result.job.index:>4}/{est_label:<4}] {status} "
+        pct_str = f"{pct:.2f}%"
+        prefix = f"  [{pct_str:>9}] {status} "
 
     rate_str = "" if result.skipped else human_rate(rate)
     suffix = f" {human_size(result.bytes_written):>10} {rate_str:>12} {human_size(remaining):>10}"
@@ -1235,10 +1230,21 @@ def download_playlist(tracks: list[Track], playlist_name: str, output_root: Path
 
 
 def download_random_fill(tracks: list[Track], output_root: Path, directory_limit: int, server: PlexServer, retries: int, retry_delay: float, timeout: int, workers: int, output_format: str, quality: str) -> tuple[int, int, int]:
+    global _RANDOM_INITIAL_FREE, _RANDOM_TARGET_FILL
     candidates = select_random_tracks(tracks, output_root)
     if not candidates:
         print("\n  Random: no new tracks remain.")
         return 0, 0, 0
+
+    try:
+        usage = shutil.disk_usage(output_root)
+        reserve = usage.total // 100
+    except OSError:
+        usage = None
+        reserve = 0
+
+    _RANDOM_INITIAL_FREE = usage.free if usage else free_space(output_root)
+    _RANDOM_TARGET_FILL = max(1, _RANDOM_INITIAL_FREE - reserve)
 
     random_root = output_root / playlist_directory("Random")
     existing_count = sum(1 for path in random_root.rglob("*.mp3")) if random_root.exists() else 0
@@ -1251,7 +1257,7 @@ def download_random_fill(tracks: list[Track], output_root: Path, directory_limit
     print(f"  Parallel:         {workers}")
     print(f"  Conversion:       {output_format}" + (f":{quality}" if quality else ""))
     print("  Fill mode:        until drive capacity")
-    print(f"  Safety reserve:   {human_size(RANDOM_FILL_RESERVE)}\n")
+    print(f"  Safety reserve:   {human_size(reserve)} (1%)\n")
 
     while cursor < len(candidates) and random_fill_space_available(output_root):
         batch = candidates[cursor : cursor + (workers * 2)]
