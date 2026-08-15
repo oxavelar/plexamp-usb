@@ -1082,7 +1082,7 @@ def print_result(result: DownloadResult, output_root: Path) -> None:
             pct = 100.0
         
         pct_str = f"{pct:.2f}%"
-        prefix = f"  [{pct_str:>9}] {status} "
+        prefix = f"  [{pct_str:>8}] {status} "
 
     rate_str = "" if result.skipped else human_rate(rate)
     suffix = f" {human_size(result.bytes_written):>10} {rate_str:>12} {human_size(remaining):>10}"
