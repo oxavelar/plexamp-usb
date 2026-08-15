@@ -3,29 +3,22 @@
 
 The program discovers a reachable Plex Media Server, authenticates only when
 local unauthenticated access is unavailable, lets the user select Plex music
-playlists, copies already-supported audio formats directly, converts other
-formats according to the configured conversion rule, and writes everything
-below a Downloads directory beside this script.
+playlists, converts unsupported audio to the configured target format, and
+writes files below a Downloads directory beside this script.
 
-Downloads are deterministic and resumable: completed files are retained,
-invalid or incomplete files are replaced, and subsequent runs only transfer
-what is missing or invalid.
+Downloads are deterministic and resumable. Existing valid files are retained,
+failed transfers are discarded, and later runs only process missing or invalid
+files.
 
-Directories can be capped at a user-selected number of audio files to
-accommodate car stereo filesystem limits. A value of -1 disables the limit.
+The conversion target is configured with entries such as ``mp3:V0``.
+Already-supported source audio bypasses FFmpeg entirely.
 
-A playlist named "Random" is treated as a special fill mode. When selected,
-tracks are sampled from the complete Plex music library and downloaded until
-the destination filesystem reaches its available-space safety threshold.
-Existing exported tracks are skipped so repeated runs continue filling the
-drive with new music.
-
-Configuration is read from settings.json beside this script. Interactive
-settings are written back so they become the defaults for the next run.
+Random mode samples new tracks from the complete Plex music library and fills
+the destination until the configured filesystem safety reserve is reached.
 
 Requirements:
     - Python 3.10+
-    - ffmpeg only when conversion is required
+    - ffmpeg
 """
 
 from __future__ import annotations
@@ -56,7 +49,12 @@ APP_NAME = "plexamp-usb"
 CONFIG_JSON = "settings.json"
 DOWNLOAD_DIR = "Downloads"
 
+# Leave room for filesystem metadata and behavior while output sizes vary.
 RANDOM_FILL_RESERVE = 128 * 1024 * 1024
+
+# A deeper queue keeps Plex/network/USB activity moving while conversion
+# concurrency remains bounded independently.
+DEFAULT_QUEUE_SIZE = 64
 
 DEFAULT_CONFIG = {
     "plex": {
@@ -69,13 +67,15 @@ DEFAULT_CONFIG = {
         "directory": DOWNLOAD_DIR,
     },
     "audio": {
-        "supported_formats": ["mp3"],
-        "conversion": "mp3:V0",
+        "conversion_formats": [
+            "mp3:V0",
+        ],
+        "conversion_threads": "auto",
     },
     "download": {
-        "retries": 5,
+        "retries": 10,
         "retry_delay": 2.0,
-        "directory_limit": 255,
+        "queue_size": DEFAULT_QUEUE_SIZE,
     },
 }
 
@@ -93,14 +93,6 @@ class PlexServer:
     @property
     def base_url(self) -> str:
         return f"{self.protocol}://{self.host}:{self.port}"
-
-
-@dataclass(frozen=True)
-class Conversion:
-    """Parsed audio conversion rule."""
-
-    format: str
-    quality: str
 
 
 @dataclass(frozen=True)
@@ -123,6 +115,18 @@ class Track:
 
 
 @dataclass(frozen=True)
+class ConversionFormat:
+    """One configured output format."""
+
+    container: str
+    quality: str
+
+    @property
+    def spec(self) -> str:
+        return f"{self.container}:{self.quality}"
+
+
+@dataclass(frozen=True)
 class DownloadJob:
     """One deterministic output location for a Plex track."""
 
@@ -130,7 +134,6 @@ class DownloadJob:
     total: int
     track: Track
     destination: Path
-    output_format: str
 
 
 @dataclass(frozen=True)
@@ -147,17 +150,20 @@ class DownloadResult:
 
 
 def compact(text: str, width: int) -> str:
-    """Fit text into a fixed console width without breaking the layout."""
+    """Fit text into a fixed console width."""
     text = str(text)
 
     if len(text) <= width:
         return text
 
-    return text[: max(0, width - 1)] + "…" if width > 1 else text[:width]
+    if width <= 1:
+        return text[:width]
+
+    return text[: width - 1] + "…"
 
 
 def human_size(value: int | float) -> str:
-    """Format a byte count using binary units."""
+    """Format bytes using binary units."""
     if value < 1024:
         return f"{value:.1f} B"
 
@@ -173,12 +179,11 @@ def human_size(value: int | float) -> str:
 
 
 def human_rate(value: float) -> str:
-    """Format a transfer rate."""
     return f"{human_size(value)}/s"
 
 
 def human_duration(milliseconds: int | str | None) -> str:
-    """Format a Plex duration in milliseconds."""
+    """Format milliseconds for console display."""
     try:
         seconds = int(float(milliseconds or 0)) // 1000
     except (TypeError, ValueError):
@@ -199,20 +204,23 @@ def human_duration(milliseconds: int | str | None) -> str:
     return f"{seconds}s"
 
 
-def stable_hash(value: str, length: int = 8) -> str:
-    """Return a short deterministic hash."""
-    return hashlib.sha1(value.encode("utf-8")).hexdigest()[:length]
-
-
 def sanitize_filename(
     value: str,
     fallback: str = "Unknown",
     max_bytes: int = 255,
 ) -> str:
-    """Return a deterministic filename-safe Unicode component."""
+    """Return a deterministic filesystem-safe filename component."""
     value = unicodedata.normalize("NFC", str(value or ""))
-    value = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]', "_", value)
-    value = re.sub(r"\s+", " ", value).strip().rstrip(". ")
+    value = value.replace("\x00", "")
+
+    value = re.sub(
+        r'[<>:"/\\|?*\x00-\x1f\x7f]',
+        "_",
+        value,
+    )
+
+    value = re.sub(r"\s+", " ", value).strip()
+    value = value.rstrip(". ")
 
     if not value:
         value = fallback
@@ -250,26 +258,45 @@ def sanitize_filename(
     )
 
 
-def track_filename(
-    track: Track,
-    number: int,
-    extension: str,
-) -> str:
+def stable_hash(value: str, length: int = 8) -> str:
+    """Return a short deterministic hash."""
+    return hashlib.sha1(
+        value.encode("utf-8")
+    ).hexdigest()[:length]
+
+
+def track_filename(track: Track, number: int, extension: str) -> str:
     """Build a stable car-friendly filename."""
-    artist = sanitize_filename(track.artist, "Unknown Artist")
-    album = sanitize_filename(track.album, "Unknown Album")
-    title = sanitize_filename(track.title, "Unknown Track")
+    artist = sanitize_filename(
+        track.artist,
+        "Unknown Artist",
+    )
+    album = sanitize_filename(
+        track.album,
+        "Unknown Album",
+    )
+    title = sanitize_filename(
+        track.title,
+        "Unknown Track",
+    )
 
     try:
         track_number = int(track.index)
     except (TypeError, ValueError):
         track_number = 0
 
-    prefix = f"{track_number:02d}" if track_number else f"{number:02d}"
-    ext = f".{extension}"
+    prefix = (
+        f"{track_number:02d}"
+        if track_number
+        else f"{number:02d}"
+    )
 
     prefix_part = f"{prefix} - {artist} - {album} - "
-    available = 255 - len((prefix_part + ext).encode("utf-8"))
+    extension = extension if extension.startswith(".") else f".{extension}"
+
+    available = 255 - len(
+        (prefix_part + extension).encode("utf-8")
+    )
 
     if available <= 0:
         album = sanitize_filename(
@@ -278,7 +305,9 @@ def track_filename(
             max_bytes=80,
         )
         prefix_part = f"{prefix} - {artist} - {album} - "
-        available = 255 - len((prefix_part + ext).encode("utf-8"))
+        available = 255 - len(
+            (prefix_part + extension).encode("utf-8")
+        )
 
     title = sanitize_filename(
         title,
@@ -286,34 +315,41 @@ def track_filename(
         max_bytes=max(1, available),
     )
 
-    return f"{prefix_part}{title}{ext}"
+    return f"{prefix_part}{title}{extension}"
 
 
 def deep_merge(base: dict, override: dict) -> dict:
-    """Recursively merge configuration overrides into defaults."""
+    """Recursively merge user configuration over defaults."""
     result = dict(base)
 
     for key, value in override.items():
-        if isinstance(result.get(key), dict) and isinstance(value, dict):
-            result[key] = deep_merge(result[key], value)
+        if (
+            isinstance(result.get(key), dict)
+            and isinstance(value, dict)
+        ):
+            result[key] = deep_merge(
+                result[key],
+                value,
+            )
         else:
             result[key] = value
 
     return result
 
 
-def config_path() -> Path:
-    """Return the configuration path beside this script."""
-    return Path(__file__).resolve().parent / CONFIG_JSON
+def save_default_config(path: Path) -> None:
+    """Write the initial configuration."""
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-
-def save_config(config: dict) -> None:
-    """Persist current settings for the next run."""
-    path = config_path()
-
-    with path.open("w", encoding="utf-8") as handle:
+    with path.open(
+        "w",
+        encoding="utf-8",
+    ) as handle:
         json.dump(
-            config,
+            DEFAULT_CONFIG,
             handle,
             indent=2,
             ensure_ascii=False,
@@ -322,17 +358,26 @@ def save_config(config: dict) -> None:
 
 
 def load_config() -> dict:
-    """Load settings, creating defaults when necessary."""
-    path = config_path()
+    """Load settings.json, creating it when absent."""
+    path = (
+        Path(__file__).resolve().parent
+        / CONFIG_JSON
+    )
 
     if not path.exists():
-        config = deep_merge({}, DEFAULT_CONFIG)
-        save_config(config)
+        save_default_config(path)
         print(f"  Created {path}")
-        return config
+
+        return deep_merge(
+            {},
+            DEFAULT_CONFIG,
+        )
 
     try:
-        with path.open("r", encoding="utf-8") as handle:
+        with path.open(
+            "r",
+            encoding="utf-8",
+        ) as handle:
             loaded = json.load(handle)
     except json.JSONDecodeError as exc:
         raise RuntimeError(
@@ -340,73 +385,96 @@ def load_config() -> dict:
         ) from exc
 
     if not isinstance(loaded, dict):
-        raise RuntimeError(f"Invalid configuration: {path}")
+        raise RuntimeError(
+            f"Invalid configuration: {path}"
+        )
 
-    return deep_merge(DEFAULT_CONFIG, loaded)
+    return deep_merge(
+        DEFAULT_CONFIG,
+        loaded,
+    )
 
 
-def parse_conversion(value: str) -> Conversion:
-    """Parse a conversion rule such as ``mp3:V0``."""
-    value = str(value or "").strip()
+def parse_conversion_format(value: str) -> ConversionFormat:
+    """Parse a format specification such as mp3:V0."""
+    value = str(value).strip()
 
     if ":" not in value:
         raise RuntimeError(
-            "audio.conversion must use format:quality, "
-            "for example mp3:V0."
+            f"Invalid audio conversion format: {value!r}. "
+            "Use format:quality, for example mp3:V0."
         )
 
-    output_format, quality = (
-        part.strip().lower()
-        for part in value.split(":", 1)
+    container, quality = value.split(
+        ":",
+        1,
     )
 
-    if not output_format or not quality:
+    container = container.strip().lower()
+    quality = quality.strip()
+
+    if not container or not quality:
         raise RuntimeError(
-            "audio.conversion must use format:quality, "
-            "for example mp3:V0."
+            f"Invalid audio conversion format: {value!r}."
         )
 
-    return Conversion(
-        format=output_format,
-        quality=quality.upper(),
+    return ConversionFormat(
+        container=container,
+        quality=quality,
     )
 
 
-def validate_audio_config(config: dict) -> Conversion:
-    """Validate audio settings without restricting conversion targets."""
-    audio = config["audio"]
+def get_conversion_formats(config: dict) -> list[ConversionFormat]:
+    """Return configured conversion targets."""
+    values = config["audio"].get(
+        "conversion_formats",
+        [],
+    )
 
-    formats = audio.get("supported_formats", [])
+    if isinstance(values, str):
+        values = [values]
 
-    if not isinstance(formats, list) or not formats:
+    if not isinstance(values, list) or not values:
         raise RuntimeError(
-            "audio.supported_formats must be a non-empty list."
+            "audio.conversion_formats must contain at least one format."
         )
 
-    normalized = [
-        str(value).strip().lower()
-        for value in formats
-        if str(value).strip()
+    formats = [
+        parse_conversion_format(value)
+        for value in values
     ]
 
-    if not normalized:
+    seen: set[str] = set()
+
+    for conversion in formats:
+        if conversion.spec in seen:
+            continue
+
+        seen.add(conversion.spec)
+
+    return formats
+
+
+def conversion_workers(value: str | int) -> int:
+    """Return the configured FFmpeg concurrency."""
+    if str(value).strip().lower() == "auto":
+        return os.cpu_count() or 1
+
+    try:
+        workers = int(value)
+    except (TypeError, ValueError) as exc:
         raise RuntimeError(
-            "audio.supported_formats must contain at least one format."
+            "audio.conversion_threads must be "
+            "'auto' or a positive integer."
+        ) from exc
+
+    if workers < 1:
+        raise RuntimeError(
+            "audio.conversion_threads must be "
+            "'auto' or a positive integer."
         )
 
-    audio["supported_formats"] = list(dict.fromkeys(normalized))
-
-    # The conversion target may intentionally also be supported. That is what
-    # makes a configured format copyable when already present at the source.
-    conversion = parse_conversion(
-        audio.get("conversion", "mp3:V0")
-    )
-
-    audio["conversion"] = (
-        f"{conversion.format}:{conversion.quality}"
-    )
-
-    return conversion
+    return workers
 
 
 def build_request(
@@ -438,10 +506,17 @@ def http_get(
     request = build_request(
         url,
         token=token,
-        accept="application/xml,application/json,text/plain,*/*",
+        accept=(
+            "application/xml,"
+            "application/json,"
+            "text/plain,*/*"
+        ),
     )
 
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urllib.request.urlopen(
+        request,
+        timeout=timeout,
+    ) as response:
         return response.read()
 
 
@@ -452,11 +527,14 @@ def plex_xml(
     timeout: int = 30,
 ) -> ET.Element:
     """Request and parse one Plex XML endpoint."""
-    query = urllib.parse.urlencode(params or {})
+    query = urllib.parse.urlencode(
+        params or {}
+    )
+
     url = f"{server.base_url}{path}"
 
     if query:
-        url += f"?{query}"
+        url = f"{url}?{query}"
 
     try:
         payload = http_get(
@@ -485,7 +563,7 @@ def test_server(
     server: PlexServer,
     timeout: int,
 ) -> ET.Element | None:
-    """Test Plex connectivity and return its identity."""
+    """Test Plex connectivity."""
     try:
         return plex_xml(
             server,
@@ -500,7 +578,10 @@ def discover_gdm_servers(
     timeout: float = 3.0,
 ) -> list[PlexServer]:
     """Discover Plex Media Servers using Plex GDM."""
-    discovered: dict[tuple[str, int], PlexServer] = {}
+    discovered: dict[
+        tuple[str, int],
+        PlexServer,
+    ] = {}
 
     message = (
         b"M-SEARCH * HTTP/1.0\r\n"
@@ -515,6 +596,7 @@ def discover_gdm_servers(
         socket.SOCK_DGRAM,
         socket.IPPROTO_UDP,
     )
+
     sock.setsockopt(
         socket.SOL_SOCKET,
         socket.SO_BROADCAST,
@@ -552,32 +634,53 @@ def discover_gdm_servers(
                 if ":" not in line:
                     continue
 
-                key, value = line.split(":", 1)
+                key, value = line.split(
+                    ":",
+                    1,
+                )
+
                 headers[key.strip().lower()] = value.strip()
 
-            if "plex/media-server" not in headers.get(
-                "content-type",
-                "",
-            ).lower():
+            if (
+                "plex/media-server"
+                not in headers.get(
+                    "content-type",
+                    "",
+                ).lower()
+            ):
                 continue
 
-            host = headers.get("host", "").strip() or address[0]
+            host = headers.get(
+                "host",
+                "",
+            ).strip() or address[0]
 
             if host.endswith(".plex.direct"):
                 host = address[0]
 
             try:
-                port = int(headers.get("port", "32400"))
+                port = int(
+                    headers.get(
+                        "port",
+                        "32400",
+                    )
+                )
             except ValueError:
                 port = 32400
 
-            name = headers.get("name", host)
+            name = headers.get(
+                "name",
+                host,
+            )
 
-            discovered[(host, port)] = PlexServer(
+            discovered[
+                (host, port)
+            ] = PlexServer(
                 name=name,
                 host=host,
                 port=port,
             )
+
     finally:
         sock.close()
 
@@ -588,10 +691,24 @@ def prompt_server(config: dict) -> PlexServer:
     """Select a Plex server, preferring local unauthenticated access."""
     plex = config["plex"]
 
-    timeout = int(plex.get("timeout", 30))
-    configured_host = str(plex.get("host") or "").strip()
-    configured_port = int(plex.get("port") or 32400)
-    configured_token = str(plex.get("token") or "").strip()
+    timeout = int(
+        plex.get(
+            "timeout",
+            30,
+        )
+    )
+
+    configured_host = str(
+        plex.get("host") or ""
+    ).strip()
+
+    configured_port = int(
+        plex.get("port") or 32400
+    )
+
+    configured_token = str(
+        plex.get("token") or ""
+    ).strip()
 
     if configured_host:
         configured = PlexServer(
@@ -601,27 +718,33 @@ def prompt_server(config: dict) -> PlexServer:
             token=configured_token,
         )
 
-        identity = test_server(configured, timeout)
+        identity = test_server(
+            configured,
+            timeout,
+        )
 
         if identity is not None:
-            print(
-                f"  Server: {identity.attrib.get('friendlyName', configured_host)}"
+            name = identity.attrib.get(
+                "friendlyName",
+                configured_host,
             )
-            print(f"  Address: {configured.base_url}")
+
+            print(f"  Server: {name}")
+            print(
+                f"  Address: {configured.base_url}"
+            )
             print("  Access:  OK")
 
             return PlexServer(
-                name=identity.attrib.get(
-                    "friendlyName",
-                    configured_host,
-                ),
+                name=name,
                 host=configured_host,
                 port=configured_port,
                 token=configured_token,
             )
 
         print(
-            f"  Configured server unavailable: {configured.base_url}"
+            f"  Configured server unavailable: "
+            f"{configured.base_url}"
         )
 
     print("  Discovering local Plex servers...")
@@ -636,7 +759,9 @@ def prompt_server(config: dict) -> PlexServer:
         print("  or set plex.host in settings.json.")
         print()
 
-        host = input("  Plex server address: ").strip()
+        host = input(
+            "  Plex server address: "
+        ).strip()
 
         if not host:
             raise RuntimeError(
@@ -653,7 +778,10 @@ def prompt_server(config: dict) -> PlexServer:
             protocol = "http"
 
             if ":" in host:
-                possible_host, possible_port = host.rsplit(":", 1)
+                possible_host, possible_port = host.rsplit(
+                    ":",
+                    1,
+                )
 
                 try:
                     port = int(possible_port)
@@ -678,9 +806,13 @@ def prompt_server(config: dict) -> PlexServer:
         print()
         print("  Plex servers:")
 
-        for index, candidate in enumerate(servers, 1):
+        for index, candidate in enumerate(
+            servers,
+            1,
+        ):
             print(
-                f"    {index}. {candidate.name} "
+                f"    {index}. "
+                f"{candidate.name} "
                 f"({candidate.base_url})"
             )
 
@@ -705,10 +837,14 @@ def prompt_server(config: dict) -> PlexServer:
             print("  Invalid selection.")
 
     print(
-        f"  Found: {server.name} ({server.base_url})"
+        f"  Found: {server.name} "
+        f"({server.base_url})"
     )
 
-    identity = test_server(server, timeout)
+    identity = test_server(
+        server,
+        timeout,
+    )
 
     if identity is not None:
         print("  Local access: OK")
@@ -729,7 +865,9 @@ def prompt_server(config: dict) -> PlexServer:
     token = configured_token
 
     if not token:
-        token = input("  Plex token: ").strip()
+        token = input(
+            "  Plex token: "
+        ).strip()
 
     if not token:
         raise RuntimeError(
@@ -744,7 +882,10 @@ def prompt_server(config: dict) -> PlexServer:
         token=token,
     )
 
-    identity = test_server(authenticated, timeout)
+    identity = test_server(
+        authenticated,
+        timeout,
+    )
 
     if identity is None:
         raise RuntimeError(
@@ -776,17 +917,25 @@ def select_music_library(
         timeout=timeout,
     )
 
-    libraries = []
+    libraries: list[tuple[str, str]] = []
 
     for directory in root.findall("Directory"):
         if directory.attrib.get("type") != "artist":
             continue
 
-        key = directory.attrib.get("key", "")
-        title = directory.attrib.get("title", "Music")
+        key = directory.attrib.get(
+            "key",
+            "",
+        )
+        title = directory.attrib.get(
+            "title",
+            "Music",
+        )
 
         if key:
-            libraries.append((key, title))
+            libraries.append(
+                (key, title)
+            )
 
     if not libraries:
         raise RuntimeError(
@@ -800,8 +949,13 @@ def select_music_library(
     print("Music libraries:")
     print()
 
-    for index, (_, title) in enumerate(libraries, 1):
-        print(f"  {index:>2}. {title}")
+    for index, (_, title) in enumerate(
+        libraries,
+        1,
+    ):
+        print(
+            f"  {index:>2}. {title}"
+        )
 
     while True:
         answer = input(
@@ -826,25 +980,39 @@ def get_playlists(
     server: PlexServer,
     timeout: int,
 ) -> list[tuple[str, str, int, str]]:
-    """Return audio playlists available from Plex."""
+    """Return Plex audio playlists."""
     root = plex_xml(
         server,
         "/playlists",
-        params={"playlistType": "audio"},
+        params={
+            "playlistType": "audio",
+        },
         timeout=timeout,
     )
 
     playlists = []
 
     for playlist in root.findall("Playlist"):
-        rating_key = playlist.attrib.get("ratingKey", "")
-        title = playlist.attrib.get("title", "Unnamed")
+        rating_key = playlist.attrib.get(
+            "ratingKey",
+            "",
+        )
+
+        title = playlist.attrib.get(
+            "title",
+            "Unnamed",
+        )
 
         if not rating_key:
             continue
 
         try:
-            count = int(playlist.attrib.get("leafCount", 0))
+            count = int(
+                playlist.attrib.get(
+                    "leafCount",
+                    0,
+                )
+            )
         except ValueError:
             count = 0
 
@@ -865,7 +1033,7 @@ def get_playlists(
 def choose_playlists(
     playlists: list[tuple[str, str, int, str]],
 ) -> list[tuple[str, str]]:
-    """Prompt for one or more music playlist downloads."""
+    """Prompt for one or more music playlists."""
     if not playlists:
         raise RuntimeError(
             "No Plex music playlists were found."
@@ -875,12 +1043,18 @@ def choose_playlists(
     print("Music playlists:")
     print()
 
-    for index, (_, title, count, duration) in enumerate(
+    for index, (
+        _,
+        title,
+        count,
+        duration,
+    ) in enumerate(
         playlists,
         1,
     ):
         print(
-            f"  {index:>2}. {title} "
+            f"  {index:>2}. "
+            f"{title} "
             f"({count:,} tracks, {duration})"
         )
 
@@ -896,11 +1070,12 @@ def choose_playlists(
         if answer.lower() == "a":
             return [
                 (rating_key, title)
-                for rating_key, title, _, _ in playlists
+                for rating_key, title, _, _
+                in playlists
             ]
 
         try:
-            indices = []
+            indices: list[int] = []
             random_selected = False
 
             for part in answer.split(","):
@@ -927,7 +1102,9 @@ def choose_playlists(
             ]
 
             if random_selected:
-                selected.append(("Random", "Random"))
+                selected.append(
+                    ("Random", "Random")
+                )
 
             if not selected:
                 raise ValueError
@@ -938,43 +1115,57 @@ def choose_playlists(
             print("Invalid selection.")
 
 
-def make_track(
-    server: PlexServer,
+def track_from_item(
     item: ET.Element,
+    media: ET.Element,
+    part: ET.Element,
+    server: PlexServer,
     playlist_id: str,
 ) -> Track | None:
-    """Build a Track from a Plex track element."""
-    media = item.find("Media")
-
-    if media is None:
-        return None
-
-    part = media.find("Part")
-
-    if part is None:
-        return None
-
-    key = part.attrib.get("key", "")
+    """Build a Track from one Plex item."""
+    key = part.attrib.get(
+        "key",
+        "",
+    )
 
     if not key:
         return None
 
     try:
-        source_size = int(part.attrib.get("size", 0))
+        source_size = int(
+            part.attrib.get(
+                "size",
+                0,
+            )
+        )
     except ValueError:
         source_size = 0
 
     try:
-        duration_ms = int(item.attrib.get("duration", 0))
+        duration_ms = int(
+            item.attrib.get(
+                "duration",
+                0,
+            )
+        )
     except ValueError:
         duration_ms = 0
 
     return Track(
-        rating_key=item.attrib.get("ratingKey", ""),
-        title=item.attrib.get("title", "Unknown Track"),
+        rating_key=item.attrib.get(
+            "ratingKey",
+            "",
+        ),
+        title=item.attrib.get(
+            "title",
+            "Unknown Track",
+        ),
         artist=item.attrib.get(
             "grandparentTitle",
-            item.attrib.get("originalTitle", "Unknown Artist"),
+            item.attrib.get(
+                "originalTitle",
+                "Unknown Artist",
+            ),
         ),
         album=item.attrib.get(
             "parentTitle",
@@ -988,7 +1179,10 @@ def make_track(
             "parentIndex",
             "1",
         ),
-        index=item.attrib.get("index", "0"),
+        index=item.attrib.get(
+            "index",
+            "0",
+        ),
         duration_ms=duration_ms,
         media_url=urllib.parse.urljoin(
             server.base_url,
@@ -996,8 +1190,14 @@ def make_track(
         ),
         source_size=source_size,
         playlist_id=playlist_id,
-        container=part.attrib.get("container", ""),
-        audio_codec=part.attrib.get("audioCodec", ""),
+        container=part.attrib.get(
+            "container",
+            "",
+        ),
+        audio_codec=part.attrib.get(
+            "audioCodec",
+            "",
+        ),
     )
 
 
@@ -1006,7 +1206,7 @@ def fetch_playlist_tracks(
     playlist_id: str,
     timeout: int,
 ) -> list[Track]:
-    """Fetch playable audio tracks from one Plex playlist."""
+    """Fetch playable audio tracks from a playlist."""
     root = plex_xml(
         server,
         f"/playlists/{playlist_id}/items",
@@ -1016,9 +1216,21 @@ def fetch_playlist_tracks(
     tracks = []
 
     for item in root:
-        track = make_track(
-            server,
+        media = item.find("Media")
+
+        if media is None:
+            continue
+
+        part = media.find("Part")
+
+        if part is None:
+            continue
+
+        track = track_from_item(
             item,
+            media,
+            part,
+            server,
             playlist_id,
         )
 
@@ -1033,20 +1245,34 @@ def fetch_library_tracks(
     library_key: str,
     timeout: int,
 ) -> list[Track]:
-    """Fetch all playable audio tracks from a Plex music library."""
+    """Fetch all playable audio tracks from a music library."""
     root = plex_xml(
         server,
         f"/library/sections/{library_key}/all",
-        params={"type": 10},
+        params={
+            "type": 10,
+        },
         timeout=timeout,
     )
 
     tracks = []
 
     for item in root.findall("Track"):
-        track = make_track(
-            server,
+        media = item.find("Media")
+
+        if media is None:
+            continue
+
+        part = media.find("Part")
+
+        if part is None:
+            continue
+
+        track = track_from_item(
             item,
+            media,
+            part,
+            server,
             "Random",
         )
 
@@ -1059,15 +1285,19 @@ def fetch_library_tracks(
 def unique_tracks(
     tracks: Iterable[Track],
 ) -> list[Track]:
-    """Remove duplicate playlist entries while preserving order."""
+    """Remove duplicate tracks while preserving order."""
     result = []
-    seen = set()
+    seen: set[str] = set()
 
     for track in tracks:
         identity = (
             track.rating_key
-            or f"{track.media_url}|{track.title}|"
-            f"{track.artist}|{track.album}"
+            or (
+                f"{track.media_url}|"
+                f"{track.title}|"
+                f"{track.artist}|"
+                f"{track.album}"
+            )
         )
 
         if identity in seen:
@@ -1079,15 +1309,8 @@ def unique_tracks(
     return result
 
 
-def choose_directory_limit(config: dict) -> int:
-    """Prompt for the maximum files per directory."""
-    current = int(
-        config["download"].get(
-            "directory_limit",
-            255,
-        )
-    )
-
+def choose_directory_limit() -> int:
+    """Prompt for the maximum number of files per directory."""
     print()
     print("Directory limit")
     print()
@@ -1097,28 +1320,33 @@ def choose_directory_limit(config: dict) -> int:
 
     while True:
         answer = input(
-            f"  Maximum files per directory [{current}]: "
+            "  Maximum files per directory [255]: "
         ).strip()
 
         if not answer:
-            return current
+            return 255
 
         try:
             value = int(answer)
 
-            if value == -1 or value > 0:
+            if value == -1:
+                return -1
+
+            if value > 0:
                 return value
+
         except ValueError:
             pass
 
-        print(
-            "  Enter a positive number or -1."
-        )
+        print("  Enter a positive number or -1.")
 
 
-def playlist_directory(name: str) -> str:
-    """Return a safe, stable playlist directory name."""
-    return sanitize_filename(name, "Music")
+def playlist_directory(playlist_name: str) -> str:
+    """Return a safe playlist directory name."""
+    return sanitize_filename(
+        playlist_name,
+        "Music",
+    )
 
 
 def build_output_path(
@@ -1130,43 +1358,124 @@ def build_output_path(
     extension: str,
 ) -> Path:
     """Return the deterministic destination for one track."""
-    playlist_root = root / playlist_directory(playlist_name)
+    playlist_root = (
+        root
+        / playlist_directory(playlist_name)
+    )
 
     if directory_limit == -1:
         directory = playlist_root
         directory_position = position
     else:
-        directory_number = ((position - 1) // directory_limit) + 1
-        directory_position = ((position - 1) % directory_limit) + 1
-        directory = playlist_root / f"{directory_number:03d}"
+        directory_number = (
+            (position - 1)
+            // directory_limit
+        ) + 1
 
-    return directory / track_filename(
-        track,
-        directory_position,
-        extension,
+        directory_position = (
+            (position - 1)
+            % directory_limit
+        ) + 1
+
+        directory = (
+            playlist_root
+            / f"{directory_number:03d}"
+        )
+
+    return (
+        directory
+        / track_filename(
+            track,
+            directory_position,
+            extension,
+        )
     )
 
 
-def file_is_valid(path: Path) -> bool:
-    """Check that an exported file exists and has usable content."""
+def file_is_valid(
+    path: Path,
+    expected_duration_ms: int = 0,
+) -> tuple[bool, str]:
+    """Validate an audio file and optionally verify its duration."""
     try:
-        return path.is_file() and path.stat().st_size >= 1024
+        if not path.is_file():
+            return False, "file does not exist"
+
+        if path.stat().st_size < 1024:
+            return False, "file is too small"
     except OSError:
-        return False
+        return False, "unable to inspect file"
+
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+
+    try:
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (
+        OSError,
+        subprocess.TimeoutExpired,
+    ):
+        return False, "audio validation failed"
+
+    if completed.returncode != 0:
+        return False, "audio validation failed"
+
+    if expected_duration_ms <= 0:
+        return True, ""
+
+    try:
+        actual_seconds = float(
+            completed.stdout.strip()
+        )
+    except ValueError:
+        return False, "audio duration unavailable"
+
+    expected_seconds = expected_duration_ms / 1000
+
+    # Container and encoder delay can move the reported duration slightly.
+    if abs(actual_seconds - expected_seconds) > 2.0:
+        return (
+            False,
+            "duration mismatch: "
+            f"got {human_duration(actual_seconds * 1000)}, "
+            f"expected {human_duration(expected_duration_ms)}",
+        )
+
+    return True, ""
 
 
 def check_ffmpeg() -> None:
-    """Verify FFmpeg only when conversion will be needed."""
+    """Verify FFmpeg is available."""
     try:
         completed = subprocess.run(
-            ["ffmpeg", "-version"],
+            [
+                "ffmpeg",
+                "-version",
+            ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
         )
     except OSError as exc:
         raise RuntimeError(
-            "ffmpeg is required for conversion but was not found in PATH."
+            "ffmpeg is required but was not found in PATH."
         ) from exc
 
     if completed.returncode != 0:
@@ -1175,10 +1484,27 @@ def check_ffmpeg() -> None:
         )
 
 
-def determine_workers() -> int:
-    """Choose bounded parallelism for Plex and USB I/O."""
-    cpu_count = os.cpu_count() or 2
-    return max(2, min(8, cpu_count))
+def check_ffprobe() -> None:
+    """Verify FFprobe is available for duration validation."""
+    try:
+        completed = subprocess.run(
+            [
+                "ffprobe",
+                "-version",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError as exc:
+        raise RuntimeError(
+            "ffprobe is required but was not found in PATH."
+        ) from exc
+
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "ffprobe could not be executed."
+        )
 
 
 def free_space(path: Path) -> int:
@@ -1192,25 +1518,30 @@ def free_space(path: Path) -> int:
 def random_fill_space_available(
     output_root: Path,
 ) -> bool:
-    """Return whether random fill can safely continue."""
-    return free_space(output_root) > RANDOM_FILL_RESERVE
+    """Return whether random fill can continue safely."""
+    return (
+        free_space(output_root)
+        > RANDOM_FILL_RESERVE
+    )
 
 
 def exported_track_keys(
     output_root: Path,
 ) -> set[str]:
-    """Build normalized identities from exported filenames."""
-    keys = set()
+    """Build exported artist/album/title identities from filenames."""
+    keys: set[str] = set()
 
     if not output_root.exists():
         return keys
 
     for path in output_root.rglob("*"):
-        if not path.is_file():
+        if path.suffix.lower() != ".mp3":
             continue
 
-        stem = path.stem
-        parts = stem.split(" - ", 3)
+        parts = path.stem.split(
+            " - ",
+            3,
+        )
 
         if len(parts) != 4:
             continue
@@ -1231,12 +1562,21 @@ def exported_track_keys(
 
 
 def track_identity(track: Track) -> str:
-    """Return a normalized identity for duplicate detection."""
+    """Return a normalized track identity."""
     return "|".join(
         (
-            sanitize_filename(track.artist, "").casefold(),
-            sanitize_filename(track.album, "").casefold(),
-            sanitize_filename(track.title, "").casefold(),
+            sanitize_filename(
+                track.artist,
+                "",
+            ).casefold(),
+            sanitize_filename(
+                track.album,
+                "",
+            ).casefold(),
+            sanitize_filename(
+                track.title,
+                "",
+            ).casefold(),
         )
     )
 
@@ -1245,8 +1585,10 @@ def select_random_tracks(
     tracks: list[Track],
     output_root: Path,
 ) -> list[Track]:
-    """Randomize the library and remove tracks already exported."""
-    existing = exported_track_keys(output_root)
+    """Shuffle the library and remove already-exported tracks."""
+    existing = exported_track_keys(
+        output_root
+    )
 
     candidates = [
         track
@@ -1255,62 +1597,141 @@ def select_random_tracks(
     ]
 
     random.SystemRandom().shuffle(candidates)
+
     return candidates
 
 
-def source_format(track: Track) -> str:
-    """Return the best Plex-reported source container."""
-    container = (track.container or "").strip().lower()
-
-    if container:
-        return container
-
-    codec = (track.audio_codec or "").strip().lower()
-
-    if codec:
-        return codec
-
-    path = urllib.parse.urlparse(track.media_url).path
-    extension = Path(path).suffix.lower().lstrip(".")
-
-    return extension
-
-
-def direct_copy_allowed(
+def source_matches_conversion(
     track: Track,
-    supported_formats: set[str],
+    conversion: ConversionFormat,
 ) -> bool:
     """Return whether the source can be copied without conversion."""
-    return source_format(track) in supported_formats
+    container = (
+        track.container or ""
+    ).strip().lower()
+
+    codec = (
+        track.audio_codec or ""
+    ).strip().lower()
+
+    target = conversion.container.lower()
+
+    # For the current target model, container/codec compatibility determines
+    # whether FFmpeg is needed. Quality presets cannot be inferred reliably
+    # from Plex metadata, so an already-compatible source is copied as-is.
+    if target == "mp3":
+        return (
+            container == "mp3"
+            or codec == "mp3"
+            or track.media_url.lower().split("?")[0].endswith(
+                ".mp3"
+            )
+        )
+
+    return container == target or codec == target
 
 
-def ffmpeg_quality(quality: str) -> str:
-    """Convert friendly quality names into FFmpeg's expected value."""
-    quality = quality.strip().upper()
+def ffmpeg_quality_args(
+    conversion: ConversionFormat,
+) -> list[str]:
+    """Translate the human quality value into FFmpeg arguments."""
+    container = conversion.container.lower()
+    quality = conversion.quality.strip()
 
-    presets = {
-        "V0": "0",
-        "V1": "1",
-        "V2": "2",
-        "V3": "3",
-        "V4": "4",
-        "V5": "5",
-        "V6": "6",
-        "V7": "7",
-        "V8": "8",
-        "V9": "9",
+    if container == "mp3":
+        if quality.lower().startswith("v"):
+            value = quality[1:]
+
+            if not value.isdigit():
+                raise RuntimeError(
+                    f"Invalid MP3 VBR quality: {quality}"
+                )
+
+            return [
+                "-c:a",
+                "libmp3lame",
+                "-q:a",
+                value,
+            ]
+
+        if quality.lower().endswith("k"):
+            bitrate = quality[:-1]
+
+            if not bitrate.isdigit():
+                raise RuntimeError(
+                    f"Invalid MP3 bitrate: {quality}"
+                )
+
+            return [
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                f"{bitrate}k",
+            ]
+
+        raise RuntimeError(
+            f"Unsupported MP3 quality: {quality}"
+        )
+
+    if container in {"aac", "m4a"}:
+        return [
+            "-c:a",
+            "aac",
+            "-b:a",
+            quality,
+        ]
+
+    if container == "opus":
+        return [
+            "-c:a",
+            "libopus",
+            "-b:a",
+            quality,
+        ]
+
+    if container == "flac":
+        return [
+            "-c:a",
+            "flac",
+            "-compression_level",
+            quality,
+        ]
+
+    raise RuntimeError(
+        f"Unsupported conversion format: {conversion.spec}"
+    )
+
+
+def conversion_extension(
+    conversion: ConversionFormat,
+) -> str:
+    """Return the filename extension for a conversion target."""
+    extensions = {
+        "mp3": ".mp3",
+        "aac": ".m4a",
+        "m4a": ".m4a",
+        "opus": ".opus",
+        "flac": ".flac",
     }
 
-    return presets.get(quality, quality)
+    try:
+        return extensions[
+            conversion.container.lower()
+        ]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"Unsupported conversion format: {conversion.spec}"
+        ) from exc
 
 
 def ffmpeg_command(
     url: str,
     output: Path,
     token: str,
-    conversion: Conversion,
+    conversion: ConversionFormat,
+    copy: bool,
 ) -> list[str]:
-    """Build an FFmpeg command for the configured conversion."""
+    """Build a retry-safe FFmpeg command."""
     command = [
         "ffmpeg",
         "-hide_banner",
@@ -1350,96 +1771,32 @@ def ffmpeg_command(
         ]
     )
 
-    if conversion.format == "mp3":
+    if copy:
         command.extend(
             [
                 "-c:a",
-                "libmp3lame",
-                "-q:a",
-                ffmpeg_quality(conversion.quality),
+                "copy",
                 "-f",
-                "mp3",
+                conversion.container,
             ]
         )
     else:
-        raise RuntimeError(
-            f"Unsupported conversion format: {conversion.format}"
+        command.extend(
+            ffmpeg_quality_args(
+                conversion
+            )
+        )
+
+        command.extend(
+            [
+                "-f",
+                conversion.container,
+            ]
         )
 
     command.append(str(output))
+
     return command
-
-
-def direct_download(
-    url: str,
-    destination: Path,
-    token: str,
-    timeout: int,
-) -> tuple[bool, int, str]:
-    """Stream an already-supported source directly to disk."""
-    destination.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    part_path = destination.with_name(
-        destination.name + ".part"
-    )
-
-    try:
-        part_path.unlink(missing_ok=True)
-    except OSError:
-        pass
-
-    try:
-        request = build_request(
-            url,
-            token=token,
-        )
-
-        with urllib.request.urlopen(
-            request,
-            timeout=max(60, timeout),
-        ) as response:
-            with part_path.open("wb") as output:
-                shutil.copyfileobj(
-                    response,
-                    output,
-                    length=1024 * 1024,
-                )
-
-    except Exception as exc:
-        try:
-            part_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-        return False, 0, str(exc)
-
-    try:
-        size = part_path.stat().st_size
-    except OSError:
-        size = 0
-
-    if size < 1024:
-        try:
-            part_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-        return False, 0, "download produced an empty or incomplete file"
-
-    try:
-        os.replace(part_path, destination)
-    except OSError as exc:
-        try:
-            part_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-        return False, 0, str(exc)
-
-    return True, size, ""
 
 
 def run_ffmpeg(
@@ -1447,9 +1804,11 @@ def run_ffmpeg(
     destination: Path,
     token: str,
     timeout: int,
-    conversion: Conversion,
+    conversion: ConversionFormat,
+    copy: bool,
+    expected_duration_ms: int,
 ) -> tuple[bool, int, str]:
-    """Convert one track into an atomic temporary output file."""
+    """Transfer one track into an atomic temporary file."""
     destination.parent.mkdir(
         parents=True,
         exist_ok=True,
@@ -1460,7 +1819,9 @@ def run_ffmpeg(
     )
 
     try:
-        part_path.unlink(missing_ok=True)
+        part_path.unlink(
+            missing_ok=True
+        )
     except OSError:
         pass
 
@@ -1469,6 +1830,7 @@ def run_ffmpeg(
         output=part_path,
         token=token,
         conversion=conversion,
+        copy=copy,
     )
 
     try:
@@ -1477,31 +1839,43 @@ def run_ffmpeg(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=max(60, timeout) * 30,
+            timeout=max(
+                60,
+                timeout,
+            ) * 30,
             check=False,
         )
     except subprocess.TimeoutExpired:
-        try:
-            part_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        part_path.unlink(missing_ok=True)
 
-        return False, 0, "ffmpeg timed out"
+        return (
+            False,
+            0,
+            "ffmpeg timed out",
+        )
     except OSError as exc:
-        return False, 0, str(exc)
+        return (
+            False,
+            0,
+            str(exc),
+        )
 
     if completed.returncode != 0:
         error = (
             completed.stderr.strip()
-            or f"ffmpeg exited with code {completed.returncode}"
+            or (
+                "ffmpeg exited with code "
+                f"{completed.returncode}"
+            )
         )
 
-        try:
-            part_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        part_path.unlink(missing_ok=True)
 
-        return False, 0, error[-1600:]
+        return (
+            False,
+            0,
+            error[-1600:],
+        )
 
     try:
         size = part_path.stat().st_size
@@ -1509,39 +1883,172 @@ def run_ffmpeg(
         size = 0
 
     if size < 1024:
-        try:
-            part_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        part_path.unlink(missing_ok=True)
 
-        return False, 0, "ffmpeg produced an empty or incomplete file"
+        return (
+            False,
+            0,
+            "ffmpeg produced an empty or incomplete file",
+        )
+
+    valid, error = file_is_valid(
+        part_path,
+        expected_duration_ms,
+    )
+
+    if not valid:
+        part_path.unlink(missing_ok=True)
+
+        return (
+            False,
+            0,
+            error,
+        )
 
     try:
-        os.replace(part_path, destination)
+        os.replace(
+            part_path,
+            destination,
+        )
     except OSError as exc:
-        try:
-            part_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        part_path.unlink(missing_ok=True)
 
-        return False, 0, str(exc)
+        return (
+            False,
+            0,
+            str(exc),
+        )
 
-    return True, size, ""
+    return (
+        True,
+        size,
+        "",
+    )
+
+
+def copy_source(
+    url: str,
+    destination: Path,
+    token: str,
+    timeout: int,
+    expected_duration_ms: int,
+) -> tuple[bool, int, str]:
+    """Copy an already-supported source into an atomic destination."""
+    destination.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    part_path = destination.with_name(
+        destination.name + ".part"
+    )
+
+    part_path.unlink(missing_ok=True)
+
+    request = build_request(
+        url,
+        token=token,
+    )
+
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=timeout,
+        ) as response:
+            with part_path.open(
+                "wb"
+            ) as output:
+                while True:
+                    chunk = response.read(
+                        1024 * 1024
+                    )
+
+                    if not chunk:
+                        break
+
+                    output.write(chunk)
+
+    except (
+        OSError,
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+    ) as exc:
+        part_path.unlink(missing_ok=True)
+
+        return (
+            False,
+            0,
+            str(exc),
+        )
+
+    try:
+        size = part_path.stat().st_size
+    except OSError:
+        size = 0
+
+    if size < 1024:
+        part_path.unlink(missing_ok=True)
+
+        return (
+            False,
+            0,
+            "source transfer was empty or incomplete",
+        )
+
+    valid, error = file_is_valid(
+        part_path,
+        expected_duration_ms,
+    )
+
+    if not valid:
+        part_path.unlink(missing_ok=True)
+
+        return (
+            False,
+            0,
+            error,
+        )
+
+    try:
+        os.replace(
+            part_path,
+            destination,
+        )
+    except OSError as exc:
+        part_path.unlink(missing_ok=True)
+
+        return (
+            False,
+            0,
+            str(exc),
+        )
+
+    return (
+        True,
+        size,
+        "",
+    )
 
 
 def download_track(
     job: DownloadJob,
     server: PlexServer,
-    supported_formats: set[str],
-    conversion: Conversion,
+    conversion: ConversionFormat,
     retries: int,
     retry_delay: float,
     timeout: int,
 ) -> DownloadResult:
-    """Copy or convert one track with retry-safe semantics."""
-    if file_is_valid(job.destination):
+    """Download one track, retrying invalid transfers."""
+    destination = job.destination
+
+    valid, _ = file_is_valid(
+        destination,
+        job.track.duration_ms,
+    )
+
+    if valid:
         try:
-            size = job.destination.stat().st_size
+            size = destination.stat().st_size
         except OSError:
             size = 0
 
@@ -1555,27 +2062,35 @@ def download_track(
         )
 
     started = time.monotonic()
-    last_error = "unknown error"
-    direct = direct_copy_allowed(
+
+    copy = source_matches_conversion(
         job.track,
-        supported_formats,
+        conversion,
     )
 
-    for attempt in range(1, retries + 1):
-        if direct:
-            success, size, error = direct_download(
+    last_error = "unknown error"
+
+    for attempt in range(
+        1,
+        retries + 1,
+    ):
+        if copy:
+            success, size, error = copy_source(
                 url=job.track.media_url,
-                destination=job.destination,
+                destination=destination,
                 token=server.token,
                 timeout=timeout,
+                expected_duration_ms=job.track.duration_ms,
             )
         else:
             success, size, error = run_ffmpeg(
                 url=job.track.media_url,
-                destination=job.destination,
+                destination=destination,
                 token=server.token,
                 timeout=timeout,
                 conversion=conversion,
+                copy=False,
+                expected_duration_ms=job.track.duration_ms,
             )
 
         if success:
@@ -1590,13 +2105,19 @@ def download_track(
 
         last_error = error
 
-        if attempt < retries:
-            delay = min(
-                30.0,
-                retry_delay * (2 ** (attempt - 1)),
-            )
-            delay += (job.index % 7) * 0.15
-            time.sleep(delay)
+        if attempt >= retries:
+            break
+
+        delay = min(
+            30.0,
+            retry_delay * (2 ** (attempt - 1)),
+        )
+
+        delay += (
+            job.index % 7
+        ) * 0.15
+
+        time.sleep(delay)
 
     return DownloadResult(
         job=job,
@@ -1613,7 +2134,7 @@ def print_result(
     result: DownloadResult,
     output_root: Path,
 ) -> None:
-    """Print one compact, aligned download result."""
+    """Print one compact download result."""
     status = "✓" if result.success else "✗"
 
     rate = (
@@ -1630,13 +2151,14 @@ def print_result(
     )
 
     total = (
-        str(result.job.total)
-        if result.job.total
-        else "?"
+        "?"
+        if result.job.total <= 0
+        else str(result.job.total)
     )
 
     print(
-        f"  [{result.job.index:>4}/{total:<4}] "
+        f"  [{result.job.index:>4}/"
+        f"{total:<4}] "
         f"{status} "
         f"{compact(label, 55):<55} "
         f"{human_size(result.bytes_written):>10} "
@@ -1645,7 +2167,9 @@ def print_result(
     )
 
     if result.skipped:
-        print("       ↳ already downloaded")
+        print(
+            "       ↳ already downloaded"
+        )
 
     if not result.success:
         print(
@@ -1658,41 +2182,104 @@ def create_jobs(
     playlist_name: str,
     output_root: Path,
     directory_limit: int,
-    supported_formats: set[str],
-    conversion: Conversion,
+    extension: str,
 ) -> list[DownloadJob]:
     """Create deterministic download jobs."""
     jobs = []
 
-    for index, track in enumerate(tracks, 1):
-        if direct_copy_allowed(
-            track,
-            supported_formats,
-        ):
-            extension = source_format(track)
-        else:
-            extension = conversion.format
-
-        destination = build_output_path(
-            root=output_root,
-            playlist_name=playlist_name,
-            position=index,
-            track=track,
-            directory_limit=directory_limit,
-            extension=extension,
-        )
-
+    for index, track in enumerate(
+        tracks,
+        1,
+    ):
         jobs.append(
             DownloadJob(
                 index=index,
                 total=len(tracks),
                 track=track,
-                destination=destination,
-                output_format=extension,
+                destination=build_output_path(
+                    root=output_root,
+                    playlist_name=playlist_name,
+                    position=index,
+                    track=track,
+                    directory_limit=directory_limit,
+                    extension=extension,
+                ),
             )
         )
 
     return jobs
+
+
+def download_jobs(
+    jobs: list[DownloadJob],
+    output_root: Path,
+    server: PlexServer,
+    conversion: ConversionFormat,
+    retries: int,
+    retry_delay: float,
+    timeout: int,
+    conversion_workers_count: int,
+    queue_size: int,
+) -> tuple[int, int, int]:
+    """Process a deep queue while limiting simultaneous conversions."""
+    downloaded = 0
+    failed = 0
+    written = 0
+
+    # The executor owns the conversion limit. The submission window is larger
+    # so network and USB work can stay queued without spawning more converters.
+    pending: set[
+        concurrent.futures.Future[DownloadResult]
+    ] = set()
+
+    iterator = iter(jobs)
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=conversion_workers_count,
+        thread_name_prefix="plex",
+    ) as executor:
+        while True:
+            while len(pending) < queue_size:
+                try:
+                    job = next(iterator)
+                except StopIteration:
+                    break
+
+                pending.add(
+                    executor.submit(
+                        download_track,
+                        job,
+                        server,
+                        conversion,
+                        retries,
+                        retry_delay,
+                        timeout,
+                    )
+                )
+
+            if not pending:
+                break
+
+            done, pending = concurrent.futures.wait(
+                pending,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+
+            for future in done:
+                result = future.result()
+
+                if result.success:
+                    downloaded += 1
+                    written += result.bytes_written
+                else:
+                    failed += 1
+
+                print_result(
+                    result,
+                    output_root,
+                )
+
+    return downloaded, failed, written
 
 
 def download_playlist(
@@ -1700,89 +2287,71 @@ def download_playlist(
     playlist_name: str,
     output_root: Path,
     directory_limit: int,
+    extension: str,
     server: PlexServer,
-    supported_formats: set[str],
-    conversion: Conversion,
+    conversion: ConversionFormat,
     retries: int,
     retry_delay: float,
     timeout: int,
+    conversion_workers_count: int,
+    queue_size: int,
 ) -> tuple[int, int, int]:
-    """Download all tracks from one playlist in parallel."""
+    """Download one playlist."""
     if not tracks:
         return 0, 0, 0
 
     jobs = create_jobs(
-        tracks,
-        playlist_name,
-        output_root,
-        directory_limit,
-        supported_formats,
-        conversion,
+        tracks=tracks,
+        playlist_name=playlist_name,
+        output_root=output_root,
+        directory_limit=directory_limit,
+        extension=extension,
     )
-
-    workers = determine_workers()
 
     print()
     print(f"  {playlist_name}")
-    print(f"  {'─' * min(72, len(playlist_name) + 2)}")
-    print(f"  Tracks:     {len(jobs):,}")
-    print(f"  Parallel:   {workers}")
     print(
-        f"  Conversion: {conversion.format}:{conversion.quality}"
+        f"  {'─' * min(72, len(playlist_name) + 2)}"
+    )
+    print(f"  Tracks:          {len(jobs):,}")
+    print(
+        f"  Conversion:      {conversion.spec}"
+    )
+    print(
+        f"  Conversion jobs: {conversion_workers_count}"
+    )
+    print(
+        f"  Queue:           {queue_size}"
     )
     print()
 
-    downloaded = 0
-    failed = 0
-    written = 0
-
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=workers,
-        thread_name_prefix="plex",
-    ) as executor:
-        futures = [
-            executor.submit(
-                download_track,
-                job,
-                server,
-                supported_formats,
-                conversion,
-                retries,
-                retry_delay,
-                timeout,
-            )
-            for job in jobs
-        ]
-
-        for future in concurrent.futures.as_completed(futures):
-            result = future.result()
-
-            if result.success:
-                downloaded += 1
-                written += result.bytes_written
-            else:
-                failed += 1
-
-            print_result(
-                result,
-                output_root,
-            )
-
-    return downloaded, failed, written
+    return download_jobs(
+        jobs=jobs,
+        output_root=output_root,
+        server=server,
+        conversion=conversion,
+        retries=retries,
+        retry_delay=retry_delay,
+        timeout=timeout,
+        conversion_workers_count=conversion_workers_count,
+        queue_size=queue_size,
+    )
 
 
 def download_random_fill(
     tracks: list[Track],
     output_root: Path,
     directory_limit: int,
+    extension: str,
     server: PlexServer,
-    supported_formats: set[str],
-    conversion: Conversion,
+    conversion: ConversionFormat,
     retries: int,
     retry_delay: float,
     timeout: int,
+    conversion_workers_count: int,
+    queue_size: int,
 ) -> tuple[int, int, int]:
-    """Fill available USB capacity with random new music."""
+    """Fill remaining USB capacity with random new music."""
     candidates = select_random_tracks(
         tracks,
         output_root,
@@ -1793,18 +2362,42 @@ def download_random_fill(
         print("  Random: no new tracks remain.")
         return 0, 0, 0
 
-    workers = determine_workers()
+    random_root = (
+        output_root
+        / playlist_directory("Random")
+    )
+
+    existing_count = (
+        sum(
+            1
+            for path in random_root.rglob("*")
+            if path.suffix.lower() == extension.lower()
+        )
+        if random_root.exists()
+        else 0
+    )
 
     print()
     print("  Random")
     print("  ──────")
-    print(f"  Library tracks:   {len(tracks):,}")
-    print(f"  New candidates:   {len(candidates):,}")
-    print(f"  Parallel:         {workers}")
     print(
-        f"  Conversion:       {conversion.format}:{conversion.quality}"
+        f"  Library tracks:   {len(tracks):,}"
     )
-    print("  Fill mode:        until drive capacity")
+    print(
+        f"  New candidates:   {len(candidates):,}"
+    )
+    print(
+        f"  Conversion:       {conversion.spec}"
+    )
+    print(
+        f"  Conversion jobs:  {conversion_workers_count}"
+    )
+    print(
+        f"  Queue:            {queue_size}"
+    )
+    print(
+        "  Fill mode:        until drive capacity"
+    )
     print(
         f"  Safety reserve:   {human_size(RANDOM_FILL_RESERVE)}"
     )
@@ -1813,19 +2406,6 @@ def download_random_fill(
     downloaded = 0
     failed = 0
     written = 0
-
-    random_root = output_root / playlist_directory("Random")
-
-    existing_count = (
-        sum(
-            1
-            for path in random_root.rglob("*")
-            if path.is_file()
-        )
-        if random_root.exists()
-        else 0
-    )
-
     position = existing_count + 1
     cursor = 0
 
@@ -1833,74 +2413,57 @@ def download_random_fill(
         cursor < len(candidates)
         and random_fill_space_available(output_root)
     ):
-        batch = candidates[cursor : cursor + workers]
-        cursor += len(batch)
+        batch_size = min(
+            queue_size,
+            len(candidates) - cursor,
+        )
+
+        batch = candidates[
+            cursor : cursor + batch_size
+        ]
 
         jobs = []
 
         for track in batch:
-            extension = (
-                source_format(track)
-                if direct_copy_allowed(
-                    track,
-                    supported_formats,
-                )
-                else conversion.format
-            )
-
-            destination = build_output_path(
-                root=output_root,
-                playlist_name="Random",
-                position=position,
-                track=track,
-                directory_limit=directory_limit,
-                extension=extension,
-            )
-
             jobs.append(
                 DownloadJob(
                     index=position,
                     total=0,
                     track=track,
-                    destination=destination,
-                    output_format=extension,
+                    destination=build_output_path(
+                        root=output_root,
+                        playlist_name="Random",
+                        position=position,
+                        track=track,
+                        directory_limit=directory_limit,
+                        extension=extension,
+                    ),
                 )
             )
 
             position += 1
 
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=workers,
-            thread_name_prefix="random",
-        ) as executor:
-            futures = [
-                executor.submit(
-                    download_track,
-                    job,
-                    server,
-                    supported_formats,
-                    conversion,
-                    retries,
-                    retry_delay,
-                    timeout,
-                )
-                for job in jobs
-            ]
+        cursor += batch_size
 
-            for future in concurrent.futures.as_completed(futures):
-                result = future.result()
-                print_result(
-                    result,
-                    output_root,
-                )
+        d, f, w = download_jobs(
+            jobs=jobs,
+            output_root=output_root,
+            server=server,
+            conversion=conversion,
+            retries=retries,
+            retry_delay=retry_delay,
+            timeout=timeout,
+            conversion_workers_count=conversion_workers_count,
+            queue_size=queue_size,
+        )
 
-                if result.success:
-                    downloaded += 1
-                    written += result.bytes_written
-                else:
-                    failed += 1
+        downloaded += d
+        failed += f
+        written += w
 
-        if not random_fill_space_available(output_root):
+        if not random_fill_space_available(
+            output_root
+        ):
             break
 
     remaining = free_space(output_root)
@@ -1921,27 +2484,57 @@ def download_random_fill(
 
 
 def main() -> int:
-    """Run the interactive Plex music download workflow."""
+    """Run the interactive Plex music export workflow."""
     print()
     print("=" * 78)
-    print("                              plexamp-usb")
+    print(
+        "                              plexamp-usb"
+    )
     print("=" * 78)
     print()
-    print("  Export Plex music to a car-friendly USB filesystem.")
+    print(
+        "  Export Plex music to a car-friendly USB filesystem."
+    )
     print()
+
+    interrupted = False
 
     try:
-        config = load_config()
-        conversion = validate_audio_config(config)
+        check_ffmpeg()
+        check_ffprobe()
 
-        supported_formats = set(
-            config["audio"]["supported_formats"]
+        config = load_config()
+
+        conversion_formats = get_conversion_formats(
+            config
+        )
+
+        conversion = conversion_formats[0]
+
+        conversion_workers_count = conversion_workers(
+            config["audio"].get(
+                "conversion_threads",
+                "auto",
+            )
+        )
+
+        queue_size = max(
+            1,
+            int(
+                config["download"].get(
+                    "queue_size",
+                    DEFAULT_QUEUE_SIZE,
+                )
+            ),
         )
 
         server = prompt_server(config)
 
         timeout = int(
-            config["plex"].get("timeout", 30)
+            config["plex"].get(
+                "timeout",
+                30,
+            )
         )
 
         library_key, section_name = select_music_library(
@@ -1950,26 +2543,27 @@ def main() -> int:
         )
 
         print()
-        print(f"Music library: {section_name}")
+        print(
+            f"Music library: {section_name}"
+        )
 
         playlists = get_playlists(
             server,
             timeout,
         )
 
-        selected = choose_playlists(playlists)
-
-        directory_limit = choose_directory_limit(config)
-
-        configured_output = (
-            str(
-                config["output"].get(
-                    "directory",
-                    DOWNLOAD_DIR,
-                )
-            ).strip()
-            or DOWNLOAD_DIR
+        selected = choose_playlists(
+            playlists
         )
+
+        directory_limit = choose_directory_limit()
+
+        configured_output = str(
+            config["output"].get(
+                "directory",
+                DOWNLOAD_DIR,
+            )
+        ).strip() or DOWNLOAD_DIR
 
         output_root = (
             Path(__file__).resolve().parent
@@ -1981,7 +2575,7 @@ def main() -> int:
             int(
                 config["download"].get(
                     "retries",
-                    5,
+                    10,
                 )
             ),
         )
@@ -1996,8 +2590,9 @@ def main() -> int:
             ),
         )
 
-        config["download"]["directory_limit"] = directory_limit
-        save_config(config)
+        extension = conversion_extension(
+            conversion
+        )
 
         has_random = any(
             title.casefold().strip() == "random"
@@ -2007,28 +2602,40 @@ def main() -> int:
         print()
         print("Download configuration")
         print()
-        print(f"  Server:       {server.name}")
-        print(f"  Address:      {server.base_url}")
         print(
-            f"  Supported:    {', '.join(sorted(supported_formats))}"
+            f"  Server:             {server.name}"
         )
         print(
-            f"  Conversion:   {conversion.format}:{conversion.quality}"
+            f"  Address:            {server.base_url}"
         )
-        print(f"  Parallel:     {determine_workers()} workers")
-        print(f"  Retries:      {retries}")
         print(
-            "  Directory:    "
+            f"  Conversion:         {conversion.spec}"
+        )
+        print(
+            f"  Conversion threads: {conversion_workers_count}"
+        )
+        print(
+            f"  Queue:              {queue_size}"
+        )
+        print(
+            f"  Retries:            {retries}"
+        )
+        print(
+            "  Directory:          "
             + (
                 "unlimited"
                 if directory_limit == -1
                 else str(directory_limit)
             )
         )
-        print(f"  Destination:  {output_root}")
+        print(
+            f"  Destination:        {output_root}"
+        )
 
         if has_random:
-            print("  Random fill:  enabled")
+            print(
+                "  Random fill:        enabled"
+            )
 
         print()
 
@@ -2037,7 +2644,10 @@ def main() -> int:
             exist_ok=True,
         )
 
-        selected_tracks = []
+        selected_tracks: list[
+            tuple[str, list[Track]]
+        ] = []
+
         random_selected = False
 
         print("Collecting music...")
@@ -2063,12 +2673,17 @@ def main() -> int:
             )
 
             selected_tracks.append(
-                (playlist_name, tracks)
+                (
+                    playlist_name,
+                    tracks,
+                )
             )
 
-            print(f"{len(tracks):>6,} tracks")
+            print(
+                f"{len(tracks):>6,} tracks"
+            )
 
-        random_tracks = []
+        random_tracks: list[Track] = []
 
         if random_selected:
             print(
@@ -2090,35 +2705,18 @@ def main() -> int:
                 f"{len(random_tracks):>6,} tracks"
             )
 
-        # FFmpeg is only required when at least one selected source needs
-        # conversion. Supported source formats are copied directly.
-        all_tracks = [
-            track
-            for _, tracks in selected_tracks
-            for track in tracks
-        ] + random_tracks
-
-        needs_conversion = any(
-            not direct_copy_allowed(
-                track,
-                supported_formats,
-            )
-            for track in all_tracks
-        )
-
-        if needs_conversion:
-            check_ffmpeg()
-
         print()
 
         grand_downloaded = 0
         grand_failed = 0
         grand_written = 0
 
+        # Explicit playlists run first so Random consumes only remaining space.
         for playlist_name, tracks in selected_tracks:
             if not tracks:
                 print(
-                    f"  Skipping empty download: {playlist_name}"
+                    f"  Skipping empty download: "
+                    f"{playlist_name}"
                 )
                 continue
 
@@ -2127,31 +2725,33 @@ def main() -> int:
                 playlist_name=playlist_name,
                 output_root=output_root,
                 directory_limit=directory_limit,
+                extension=extension,
                 server=server,
-                supported_formats=supported_formats,
                 conversion=conversion,
                 retries=retries,
                 retry_delay=retry_delay,
                 timeout=timeout,
+                conversion_workers_count=conversion_workers_count,
+                queue_size=queue_size,
             )
 
             grand_downloaded += downloaded
             grand_failed += failed
             grand_written += written
 
-        # Random is deliberately last so it consumes only capacity left after
-        # explicitly requested playlists have been exported.
         if random_selected:
             downloaded, failed, written = download_random_fill(
                 tracks=random_tracks,
                 output_root=output_root,
                 directory_limit=directory_limit,
+                extension=extension,
                 server=server,
-                supported_formats=supported_formats,
                 conversion=conversion,
                 retries=retries,
                 retry_delay=retry_delay,
                 timeout=timeout,
+                conversion_workers_count=conversion_workers_count,
+                queue_size=queue_size,
             )
 
             grand_downloaded += downloaded
@@ -2196,22 +2796,42 @@ def main() -> int:
             print()
             return 2
 
-        print("  ✓ All downloads completed successfully.")
+        print(
+            "  ✓ All downloads completed successfully."
+        )
         print()
 
         return 0
 
     except KeyboardInterrupt:
-        # Keep the abort notice on the current status line before presenting
-        # the final interrupted state.
-        print("\r  Aborting...".ljust(78), end="", flush=True)
-        print("\r  Interrupted.".ljust(78))
+        interrupted = True
+
+        # Keep the interruption state visually distinct before replacing it.
+        print(
+            "\r  Aborting...        ",
+            end="",
+            flush=True,
+        )
+
+        time.sleep(0.15)
+
+        print(
+            "\r  Interrupted.       "
+        )
+
         return 130
 
     except Exception as exc:
         print()
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print(
+            f"ERROR: {exc}",
+            file=sys.stderr,
+        )
         return 1
+
+    finally:
+        if interrupted:
+            pass
 
 
 if __name__ == "__main__":
