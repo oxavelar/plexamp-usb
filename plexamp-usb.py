@@ -1077,7 +1077,7 @@ def download_jobs(
     output_format: str,
     quality: str,
 ) -> tuple[int, int, int]:
-    """Process download queue using dynamic adaptive concurrency."""
+    """Process download queue using dynamic adaptive concurrency with instant Ctrl+C handling."""
     downloaded, failed, written = 0, 0, 0
     interrupted = False
     adaptive = AdaptiveConcurrency(max_workers)
@@ -1113,10 +1113,15 @@ def download_jobs(
             if not futures:
                 break
 
+            # Short timeout allows main thread to wake up frequently and catch KeyboardInterrupt instantly
             done, futures = concurrent.futures.wait(
                 futures,
+                timeout=0.2,
                 return_when=concurrent.futures.FIRST_COMPLETED,
             )
+
+            if not done:
+                continue
 
             for future in done:
                 try:
@@ -1144,6 +1149,7 @@ def download_jobs(
             for future in futures:
                 future.cancel()
 
+            # Shutdown immediately without waiting for active worker thread I/O joins
             executor.shutdown(wait=False, cancel_futures=True)
             print("\r  Interrupted and safely stopped.             ")
         
