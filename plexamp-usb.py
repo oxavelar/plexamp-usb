@@ -30,8 +30,6 @@ Requirements:
     - ffmpeg and ffprobe when conversion is required
 """
 
-from __platform__ import annotations  # type: ignore
-
 from __future__ import annotations
 
 import concurrent.futures
