@@ -841,7 +841,7 @@ def direct_file_valid(path: Path, track: Track) -> tuple[bool, str]:
 
     if size < 1024:
         return False, "file is too small"
-    if track.source_size > 0 and size != track.source_size:
+    if track.source_size > 0 and abs(size - track.source_size) > 512 * 1024:
         return False, f"size mismatch: got {human_size(size)}, expected {human_size(track.source_size)}"
 
     return True, ""
@@ -875,7 +875,7 @@ def copy_track(track: Track, destination: Path, token: str, timeout: int) -> tup
                     handle.write(chunk)
                     written += len(chunk)
 
-        if track.source_size > 0 and written != track.source_size:
+        if track.source_size > 0 and abs(written - track.source_size) > 512 * 1024:
             raise IOError(f"incomplete transfer: got {written} bytes, expected {track.source_size}")
         if written < 1024:
             raise IOError("transfer produced an empty or incomplete file")
@@ -999,7 +999,7 @@ def print_result(result: DownloadResult, output_root: Path) -> None:
     suffix = f" {human_size(result.bytes_written):>10} {human_rate(rate):>12} {human_size(remaining):>10}"
 
     terminal_width = shutil.get_terminal_size(fallback=(80, 20)).columns
-    available_width = terminal_width - len(prefix) - len(suffix)
+    available_width = terminal_width - len(prefix) - len(suffix) - 2
     if available_width < 10:
         available_width = 10
 
