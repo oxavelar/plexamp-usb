@@ -1057,6 +1057,22 @@ def download_track(job: DownloadJob, server: PlexServer, retries: int, retry_del
     return DownloadResult(job=job, success=False, skipped=False, bytes_written=0, elapsed=(time.monotonic() - started), attempts=retries, error=last_error)
 
 
+def get_average_track_size(random_root: Path) -> int:
+    if not random_root.exists():
+        return 7 * 1024 * 1024  # Default assumption ~7 MB per V0 MP3 track
+    total_size = 0
+    count = 0
+    for path in random_root.rglob("*.mp3"):
+        try:
+            total_size += path.stat().st_size
+            count += 1
+        except OSError:
+            continue
+    if count > 0 and total_size > 0:
+        return int(total_size / count)
+    return 7 * 1024 * 1024
+
+
 def print_result(result: DownloadResult, output_root: Path) -> None:
     status = "-" if result.skipped else ("✓" if result.success else "✗")
     rate = result.bytes_written / result.elapsed if result.elapsed > 0 else 0
@@ -1066,12 +1082,14 @@ def print_result(result: DownloadResult, output_root: Path) -> None:
     if result.job.total:
         prefix = f"  [{result.job.index:>4}/{result.job.total:<4}] {status} "
     else:
-        index_str = str(result.job.index)
-        padding = max(0, 9 - len(index_str))
-        left = padding // 2
-        right = padding - left
-        centered_index = f"{' ' * left}{index_str}{' ' * right}"
-        prefix = f"  [{centered_index}] {status} "
+        random_root = output_root / playlist_directory("Random")
+        avg_size = get_average_track_size(random_root)
+        rem_space = free_space(output_root) - RANDOM_FILL_RESERVE
+        rem_tracks = max(0, int(rem_space / avg_size)) if avg_size > 0 else 0
+        est_total = result.job.index + rem_tracks
+        
+        est_label = f"~{est_total}"
+        prefix = f"  [{result.job.index:>4}/{est_label:<4}] {status} "
 
     rate_str = "" if result.skipped else human_rate(rate)
     suffix = f" {human_size(result.bytes_written):>10} {rate_str:>12} {human_size(remaining):>10}"
