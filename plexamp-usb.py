@@ -898,40 +898,60 @@ def direct_file_valid(path: Path, track: Track) -> tuple[bool, str]:
 def copy_track(track: Track, destination: Path, token: str, timeout: int) -> tuple[bool, int, str]:
     destination.parent.mkdir(parents=True, exist_ok=True)
     part_path = destination.with_name(destination.name + ".part")
-    existing_bytes = part_path.stat().st_size if part_path.exists() else 0
+    
+    max_internal_retries = 5
+    for attempt in range(max_internal_retries):
+        existing_bytes = part_path.stat().st_size if part_path.exists() else 0
+        if track.source_size > 0 and existing_bytes >= track.source_size:
+            break
 
-    headers = {}
-    if token:
-        headers["X-Plex-Token"] = token
-    if existing_bytes > 0:
-        headers["Range"] = f"bytes={existing_bytes}-"
+        headers = {}
+        if token:
+            headers["X-Plex-Token"] = token
+        if existing_bytes > 0:
+            headers["Range"] = f"bytes={existing_bytes}-"
 
-    request = urllib.request.Request(track.media_url, headers=headers)
-    written = existing_bytes
+        request = urllib.request.Request(track.media_url, headers=headers)
+        written = existing_bytes
+
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                mode = "ab" if existing_bytes > 0 and response.status == 206 else "wb"
+                if mode == "wb":
+                    written = 0
+
+                with part_path.open(mode) as handle:
+                    while chunk := response.read(1024 * 1024):
+                        handle.write(chunk)
+                        written += len(chunk)
+
+            if track.source_size > 0 and abs(written - track.source_size) <= 512 * 1024:
+                break
+            if track.source_size == 0 and written >= 1024:
+                break
+        except urllib.error.HTTPError as exc:
+            if exc.code == 416:
+                unlink_quiet(part_path)
+                continue
+            if attempt == max_internal_retries - 1:
+                unlink_quiet(part_path)
+                return False, 0, str(exc)
+        except Exception as exc:
+            if attempt == max_internal_retries - 1:
+                unlink_quiet(part_path)
+                return False, 0, str(exc)
 
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            mode = "ab" if existing_bytes > 0 and response.status == 206 else "wb"
-            if mode == "wb":
-                written = 0
-
-            with part_path.open(mode) as handle:
-                while chunk := response.read(1024 * 1024):
-                    handle.write(chunk)
-                    written += len(chunk)
-
-        if track.source_size > 0 and abs(written - track.source_size) > 512 * 1024:
-            raise IOError(f"incomplete transfer: got {written} bytes, expected {track.source_size}")
-        if written < 1024:
-            raise IOError("transfer produced an empty or incomplete file")
+        size = part_path.stat().st_size if part_path.exists() else 0
+        if track.source_size > 0 and abs(size - track.source_size) > 512 * 1024:
+            unlink_quiet(part_path)
+            return False, 0, f"incomplete transfer: got {size} bytes, expected {track.source_size}"
+        if size < 1024:
+            unlink_quiet(part_path)
+            return False, 0, "transfer produced an empty or incomplete file"
 
         os.replace(part_path, destination)
-        return True, written, ""
-    except urllib.error.HTTPError as exc:
-        unlink_quiet(part_path)
-        if exc.code == 416:
-            return copy_track(track, destination, token, timeout)
-        return False, 0, str(exc)
+        return True, size, ""
     except Exception as exc:
         unlink_quiet(part_path)
         return False, 0, str(exc)
@@ -1113,7 +1133,6 @@ def download_jobs(
             if not futures:
                 break
 
-            # Short timeout allows main thread to wake up frequently and catch KeyboardInterrupt instantly
             done, futures = concurrent.futures.wait(
                 futures,
                 timeout=0.2,
@@ -1149,7 +1168,6 @@ def download_jobs(
             for future in futures:
                 future.cancel()
 
-            # Shutdown immediately without waiting for active worker thread I/O joins
             executor.shutdown(wait=False, cancel_futures=True)
             print("\r  Interrupted and safely stopped.             ")
         
