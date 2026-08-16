@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/init/env python3
 """Export Plex music to a car-friendly USB filesystem.
 
 The program discovers a reachable Plex Media Server, authenticates only when
@@ -781,7 +781,8 @@ def copy_track(track: Track, destination: Path, token: str, timeout: int) -> tup
     destination.parent.mkdir(parents=True, exist_ok=True)
     part_path = destination.with_name(destination.name + ".part")
     
-    for attempt in range(5):
+    max_internal_retries = 5
+    for attempt in range(max_internal_retries):
         existing_bytes = part_path.stat().st_size if part_path.exists() else 0
         if track.source_size > 0 and existing_bytes >= track.source_size:
             break
@@ -794,30 +795,55 @@ def copy_track(track: Track, destination: Path, token: str, timeout: int) -> tup
 
         request = urllib.request.Request(track.media_url, headers=headers)
         written = existing_bytes
+        connection_dropped = False
 
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                mode = "ab" if existing_bytes > 0 and response.status == 206 else "wb"
+                status = getattr(response, "status", 200)
+                mode = "ab" if existing_bytes > 0 and status == 206 else "wb"
                 if mode == "wb":
                     written = 0
+                    if existing_bytes > 0:
+                        unlink_quiet(part_path)
+
                 with part_path.open(mode) as handle:
-                    while chunk := response.read(1024 * 1024):
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
                         handle.write(chunk)
                         written += len(chunk)
 
-            if (track.source_size > 0 and abs(written - track.source_size) <= 512 * 1024) or (track.source_size == 0 and written >= 1024):
-                break
+            if track.source_size > 0 and written < track.source_size - 512 * 1024:
+                connection_dropped = True
+
         except urllib.error.HTTPError as exc:
             if exc.code == 416:
                 unlink_quiet(part_path)
+                time.sleep(1.0)
                 continue
-            if attempt == 4:
+            if attempt == max_internal_retries - 1:
                 unlink_quiet(part_path)
                 return False, 0, str(exc)
+            time.sleep(1.0)
+            continue
         except Exception as exc:
-            if attempt == 4:
+            if attempt == max_internal_retries - 1:
                 unlink_quiet(part_path)
                 return False, 0, str(exc)
+            time.sleep(1.0)
+            continue
+
+        if connection_dropped:
+            if attempt < max_internal_retries - 1:
+                time.sleep(2.0 * (attempt + 1))
+                continue
+            else:
+                unlink_quiet(part_path)
+                return False, 0, f"incomplete transfer: got {written} bytes, expected {track.source_size}"
+
+        if (track.source_size > 0 and abs(written - track.source_size) <= 512 * 1024) or (track.source_size == 0 and written >= 1024):
+            break
 
     try:
         size = part_path.stat().st_size if part_path.exists() else 0
