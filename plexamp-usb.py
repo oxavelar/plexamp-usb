@@ -850,6 +850,7 @@ def ffmpeg_command(track: Track, output: Path, token: str, output_format: str, q
                 cmd.extend(["-b:a", norm_q.lower()])
             else:
                 cmd.extend(["-b:a", "256k"])
+        cmd.extend(["-f", "mp4"])
     elif output_format == "mp3":
         cmd.extend(["-map", "0:v?", "-c:v", "copy", "-id3v2_version", "3", "-c:a", "libmp3lame"])
         if norm_q in ("VBR", "HIGH", "HQ", "V0", ""):
@@ -860,12 +861,14 @@ def ffmpeg_command(track: Track, output: Path, token: str, output_format: str, q
             cmd.extend(["-b:a", norm_q.lower()])
         else:
             cmd.extend(["-q:a", "0"])
+        cmd.extend(["-f", "mp3"])
     else:
         cmd.extend(["-c:a", output_format])
         if re.fullmatch(r"[0-9]+K", norm_q):
             cmd.extend(["-b:a", norm_q.lower()])
         elif quality:
             cmd.extend(["-q:a", quality])
+        cmd.extend(["-f", output_format])
 
     cmd.extend([str(output)])
     return cmd
