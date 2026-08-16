@@ -1,4 +1,4 @@
-#!/usr/init/env python3
+#!/usr/bin/env python3
 """Export Plex music to a car-friendly USB filesystem.
 
 The program discovers a reachable Plex Media Server, authenticates only when
@@ -187,13 +187,46 @@ def unlink_quiet(path: Path) -> None:
         path.unlink(missing_ok=True)
 
 
+def display_width(text: str) -> int:
+    """Calculate terminal display column width, correctly ignoring variation selectors and zero-width joiners."""
+    width = 0
+    for char in str(text):
+        code = ord(char)
+        if (0xFE00 <= code <= 0xFE0F) or (0xE0100 <= code <= 0xE01EF) or (code == 0x200D):
+            continue
+        ea = unicodedata.east_asian_width(char)
+        if ea in ('W', 'F') or (0x1F000 <= code <= 0x1FAFF) or (0x2600 <= code <= 0x27BF):
+            width += 2
+        else:
+            width += 1
+    return width
+
+
+def pad_right(text: str, total_width: int) -> str:
+    text_str = str(text)
+    w = display_width(text_str)
+    if w >= total_width:
+        return text_str
+    return text_str + " " * (total_width - w)
+
+
 def compact(text: str, width: int) -> str:
     text = str(text)
-    if len(text) <= width:
+    if display_width(text) <= width:
         return text
     if width <= 1:
         return text[:width]
-    return text[: width - 1] + "…"
+    
+    current_w = 0
+    result = []
+    for char in text:
+        code = ord(char)
+        char_w = 0 if ((0xFE00 <= code <= 0xFE0F) or (0xE0100 <= code <= 0xE01EF) or (code == 0x200D)) else (2 if (unicodedata.east_asian_width(char) in ('W', 'F') or (0x1F000 <= code <= 0x1FAFF) or (0x2600 <= code <= 0x27BF)) else 1)
+        if current_w + char_w + 1 > width:
+            break
+        result.append(char)
+        current_w += char_w
+    return "".join(result) + "…"
 
 
 def human_size(value: int | float) -> str:
@@ -944,8 +977,11 @@ def print_result(result: DownloadResult, output_root: Path) -> None:
     suffix = f" {human_size(result.bytes_written):>10} {rate_str:>12} {human_size(remaining):>10}"
 
     term_width = shutil.get_terminal_size(fallback=(80, 20)).columns
-    avail_width = max(10, term_width - len(prefix) - len(suffix) - 2)
-    print(f"{prefix}{compact(label, avail_width):<{avail_width}}{suffix}")
+    avail_width = max(10, term_width - display_width(prefix) - display_width(suffix) - 2)
+    
+    compacted = compact(label, avail_width)
+    padded_label = pad_right(compacted, avail_width)
+    print(f"{prefix}{padded_label}{suffix}")
 
     if not result.success:
         print(f"       ! {compact(' '.join(result.error.split()), max(10, term_width - 9))}")
@@ -1004,7 +1040,7 @@ def download_playlist(tracks: list[Track], playlist_name: str, output_root: Path
     jobs = [DownloadJob(i, len(tracks), t, build_output_path(output_root, playlist_name, i, t, directory_limit)) for i, t in enumerate(tracks, 1)]
     
     print(f"\n  {playlist_name}")
-    print(f"  {'─' * min(72, len(playlist_name) + 2)}")
+    print(f"  {'─' * min(72, display_width(playlist_name) + 2)}")
     print(f"  Tracks:     {len(jobs):,}")
     print(f"  Parallel:   {workers}")
     print(f"  Conversion: {output_format}" + (f":{quality}" if quality else "") + "\n")
@@ -1099,13 +1135,17 @@ def main() -> int:
             if playlist_name.casefold().strip() == "random":
                 random_selected = True
                 continue
-            print(f"  {compact(playlist_name, 60):<60}", end=" ", flush=True)
+            compacted_name = compact(playlist_name, 60)
+            padded_name = pad_right(compacted_name, 60)
+            print(f"  {padded_name}", end=" ", flush=True)
             tracks = unique_tracks(fetch_playlist_tracks(server, playlist_id, timeout))
             selected_tracks.append((playlist_name, tracks))
             print(f"{len(tracks):>6,} tracks")
 
         if random_selected:
-            print(f"  {'Random':<60}", end=" ", flush=True)
+            compacted_name = compact("Random", 60)
+            padded_name = pad_right(compacted_name, 60)
+            print(f"  {padded_name}", end=" ", flush=True)
             random_tracks = unique_tracks(fetch_library_tracks(server, library_key, timeout))
             print(f"{len(random_tracks):>6,} tracks")
         print()
