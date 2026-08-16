@@ -6,8 +6,10 @@ local unauthenticated access is unavailable, lets the user select Plex music
 playlists, and exports tracks directly below a Downloads directory beside
 this script.
 
-Supported source formats are copied directly when they already match the
-configured conversion format. Other formats are converted with FFmpeg.
+Supported source formats are copied directly when they match any format in
+the configured conversion/supported list. Other formats are converted using
+FFmpeg exclusively to the top choice in order (defaulting to AAC-LC VBR
+highest quality).
 
 Downloads are deterministic and resumable. Existing complete files are kept;
 incomplete, invalid, or mismatched files are replaced and retried.
@@ -66,7 +68,7 @@ DEFAULT_CONFIG = {
         "timeout": 30,
     },
     "audio": {
-        "conversion_formats": ["mp3:V0"],
+        "conversion_formats": ["aac:vbr", "mp3:vbr"],
         "conversion_threads": "auto",
     },
     "output": {
@@ -81,6 +83,7 @@ DEFAULT_CONFIG = {
 
 _RANDOM_INITIAL_FREE = 0
 _RANDOM_TARGET_FILL = 0
+_HAS_FDK_AAC: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -289,7 +292,20 @@ def stable_hash(value: str, length: int = 8) -> str:
     return hashlib.sha1(value.encode("utf-8")).hexdigest()[:length]
 
 
-def track_filename(track: Track, number: int) -> str:
+def format_extension(fmt: str) -> str:
+    fmt = fmt.lower()
+    if fmt in ("aac", "m4a", "mp4"):
+        return ".m4a"
+    if fmt == "mp3":
+        return ".mp3"
+    if fmt == "flac":
+        return ".flac"
+    if fmt in ("ogg", "opus", "vorbis"):
+        return ".ogg"
+    return f".{fmt}"
+
+
+def track_filename(track: Track, number: int, fmt: str = "mp3") -> str:
     artist = sanitize_filename(track.artist, "Unknown Artist")
     album = sanitize_filename(track.album, "Unknown Album")
     title = sanitize_filename(track.title, "Unknown Track")
@@ -298,16 +314,16 @@ def track_filename(track: Track, number: int) -> str:
     prefix = f"{track_number:02d}" if track_number else f"{number:02d}"
 
     prefix_part = f"{prefix} - {artist} - {album} - "
-    extension = ".mp3"
-    available = 255 - len((prefix_part + extension).encode("utf-8"))
+    ext = format_extension(fmt)
+    available = 255 - len((prefix_part + ext).encode("utf-8"))
 
     if available <= 0:
         album = sanitize_filename(album, "Unknown Album", max_bytes=80)
         prefix_part = f"{prefix} - {artist} - {album} - "
-        available = 255 - len((prefix_part + extension).encode("utf-8"))
+        available = 255 - len((prefix_part + ext).encode("utf-8"))
 
     title = sanitize_filename(title, "Unknown Track", max_bytes=max(1, available))
-    return f"{prefix_part}{title}{extension}"
+    return f"{prefix_part}{title}{ext}"
 
 
 def deep_merge(base: dict, override: dict) -> dict:
@@ -654,14 +670,61 @@ def choose_directory_limit() -> int:
         print("  Enter a positive number or -1.")
 
 
-def build_output_path(root: Path, playlist_name: str, position: int, track: Track, directory_limit: int) -> Path:
+def get_format_from_spec(spec: str) -> str:
+    return spec.split(":", 1)[0].strip().lower()
+
+
+def get_track_format(track: Track) -> str:
+    container = (track.container or "").casefold()
+    codec = (track.audio_codec or "").casefold()
+    url_lower = track.media_url.casefold().split("?", 1)[0]
+    
+    if container in ("mp3", "mpeg") or codec == "mp3" or url_lower.endswith(".mp3"):
+        return "mp3"
+    if container in ("aac", "m4a", "mp4") or codec in ("aac", "mp4a") or url_lower.endswith((".aac", ".m4a", ".mp4")):
+        return "aac"
+    if container in ("flac",) or codec == "flac" or url_lower.endswith(".flac"):
+        return "flac"
+    if container in ("ogg", "oga") or codec in ("ogg", "vorbis", "opus") or url_lower.endswith((".ogg", ".opus")):
+        return "ogg"
+    return container or codec or "mp3"
+
+
+def source_matches_output(track: Track, output_format: str) -> bool:
+    output_format = output_format.lower()
+    container, codec = (track.container or "").casefold(), (track.audio_codec or "").casefold()
+    url_lower = track.media_url.casefold().split("?", 1)[0]
+    
+    if output_format == "mp3":
+        return container in ("mp3", "mpeg") or codec == "mp3" or url_lower.endswith(".mp3")
+    if output_format in ("aac", "m4a"):
+        return container in ("aac", "m4a", "mp4") or codec in ("aac", "mp4a") or url_lower.endswith((".aac", ".m4a", ".mp4"))
+    return container == output_format or codec == output_format
+
+
+def is_format_supported(track: Track, conversion_formats: list[str]) -> bool:
+    track_fmt = get_track_format(track)
+    for spec in conversion_formats:
+        fmt = get_format_from_spec(spec)
+        if track_fmt == fmt or source_matches_output(track, fmt):
+            return True
+    return False
+
+
+def build_output_path(root: Path, playlist_name: str, position: int, track: Track, directory_limit: int, conversion_formats: list[str]) -> Path:
     playlist_root = root / sanitize_filename(playlist_name, "Music")
     if directory_limit == -1:
         directory, directory_position = playlist_root, position
     else:
         directory = playlist_root / f"{((position - 1) // directory_limit) + 1:03d}"
         directory_position = ((position - 1) % directory_limit) + 1
-    return directory / track_filename(track, directory_position)
+
+    if is_format_supported(track, conversion_formats):
+        fmt = get_track_format(track)
+    else:
+        fmt = get_format_from_spec(conversion_formats[0])
+
+    return directory / track_filename(track, directory_position, fmt)
 
 
 def conversion_spec(config: dict) -> tuple[str, str]:
@@ -689,11 +752,6 @@ def conversion_threads(config: dict) -> int:
     return workers
 
 
-def source_matches_output(track: Track, output_format: str) -> bool:
-    container, codec = (track.container or "").casefold(), (track.audio_codec or "").casefold()
-    return container == output_format or codec == output_format or (output_format == "mp3" and track.media_url.casefold().split("?", 1)[0].endswith(".mp3"))
-
-
 def check_program(program: str) -> bool:
     try:
         return subprocess.run([program, "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0
@@ -704,6 +762,17 @@ def check_program(program: str) -> bool:
 def ensure_ffmpeg() -> None:
     if not check_program("ffmpeg") or not check_program("ffprobe"):
         raise RuntimeError("ffmpeg and ffprobe are required for conversion but were not found in PATH.")
+
+
+def has_libfdk_aac() -> bool:
+    global _HAS_FDK_AAC
+    if _HAS_FDK_AAC is None:
+        try:
+            res = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+            _HAS_FDK_AAC = "libfdk_aac" in res.stdout
+        except OSError:
+            _HAS_FDK_AAC = False
+    return _HAS_FDK_AAC
 
 
 def free_space(path: Path) -> int:
@@ -734,11 +803,12 @@ def track_identity(track: Track) -> str:
 def exported_track_keys(output_root: Path) -> set[str]:
     keys = set()
     if output_root.exists():
-        for path in output_root.rglob("*.mp3"):
-            parts = path.stem.split(" - ", 3)
-            if len(parts) == 4:
-                _, artist, album, title = parts
-                keys.add("|".join((artist.casefold().strip(), album.casefold().strip(), title.casefold().strip())))
+        for path in output_root.rglob("*.*"):
+            if path.suffix.lower() in (".mp3", ".m4a", ".aac", ".flac", ".ogg"):
+                parts = path.stem.split(" - ", 3)
+                if len(parts) == 4:
+                    _, artist, album, title = parts
+                    keys.add("|".join((artist.casefold().strip(), album.casefold().strip(), title.casefold().strip())))
     return keys
 
 
@@ -749,29 +819,55 @@ def select_random_tracks(tracks: list[Track], output_root: Path) -> list[Track]:
     return candidates
 
 
-def parse_quality(output_format: str, quality: str) -> list[str]:
-    if not quality:
-        return []
-    norm = quality.upper()
-    if output_format == "mp3":
-        if re.fullmatch(r"V[0-9]", norm):
-            return ["-q:a", norm[1:]]
-        if re.fullmatch(r"[0-9]+K", norm):
-            return ["-b:a", norm.lower()]
-        raise RuntimeError("MP3 conversion quality must be V0-V9 or a bitrate such as 192k.")
-    return ["-b:a", norm.lower()] if re.fullmatch(r"[0-9]+K", norm) else ["-q:a", quality]
-
-
 def ffmpeg_command(track: Track, output: Path, token: str, output_format: str, quality: str) -> list[str]:
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-threads", "1", "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_on_network_error", "1", "-reconnect_on_http_error", "429,500,502,503,504", "-reconnect_delay_max", "5"]
+    output_format = output_format.lower()
+    norm_q = quality.upper() if quality else "VBR"
+
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+        "-threads", "1",
+        "-reconnect", "1", "-reconnect_streamed", "1",
+        "-reconnect_on_network_error", "1",
+        "-reconnect_on_http_error", "429,500,502,503,504",
+        "-reconnect_delay_max", "5"
+    ]
     if token:
         cmd.extend(["-headers", f"X-Plex-Token: {token}\r\n"])
     cmd.extend(["-i", track.media_url, "-vn", "-map", "0:a:0", "-map_metadata", "0"])
-    if output_format == "mp3":
-        cmd.extend(["-map", "0:v?", "-c:v", "copy", "-id3v2_version", "3"])
-    cmd.extend(["-c:a", "libmp3lame" if output_format == "mp3" else output_format])
-    cmd.extend(parse_quality(output_format, quality))
-    cmd.extend(["-f", output_format, str(output)])
+
+    if output_format in ("aac", "m4a"):
+        if has_libfdk_aac():
+            cmd.extend(["-c:a", "libfdk_aac"])
+            if norm_q in ("VBR", "HIGH", "HQ", ""):
+                cmd.extend(["-vbr", "5"])
+            elif re.fullmatch(r"[0-9]+K", norm_q):
+                cmd.extend(["-b:a", norm_q.lower()])
+            else:
+                cmd.extend(["-vbr", "5"])
+        else:
+            cmd.extend(["-c:a", "aac"])
+            if re.fullmatch(r"[0-9]+K", norm_q):
+                cmd.extend(["-b:a", norm_q.lower()])
+            else:
+                cmd.extend(["-b:a", "256k"])
+    elif output_format == "mp3":
+        cmd.extend(["-map", "0:v?", "-c:v", "copy", "-id3v2_version", "3", "-c:a", "libmp3lame"])
+        if norm_q in ("VBR", "HIGH", "HQ", "V0", ""):
+            cmd.extend(["-q:a", "0"])
+        elif re.fullmatch(r"V[0-9]", norm_q):
+            cmd.extend(["-q:a", norm_q[1:]])
+        elif re.fullmatch(r"[0-9]+K", norm_q):
+            cmd.extend(["-b:a", norm_q.lower()])
+        else:
+            cmd.extend(["-q:a", "0"])
+    else:
+        cmd.extend(["-c:a", output_format])
+        if re.fullmatch(r"[0-9]+K", norm_q):
+            cmd.extend(["-b:a", norm_q.lower()])
+        elif quality:
+            cmd.extend(["-q:a", quality])
+
+    cmd.extend([str(output)])
     return cmd
 
 
@@ -931,20 +1027,21 @@ def convert_track(track: Track, destination: Path, token: str, timeout: int, out
         return False, 0, str(exc)
 
 
-def file_is_valid(path: Path, track: Track, output_format: str) -> tuple[bool, str]:
+def file_is_valid(path: Path, track: Track, conversion_formats: list[str]) -> tuple[bool, str]:
     if not path.is_file():
         return False, "file is missing"
-    return direct_file_valid(path, track) if source_matches_output(track, output_format) else duration_matches(path, track.duration_ms)
+    direct_copy = is_format_supported(track, conversion_formats)
+    return direct_file_valid(path, track) if direct_copy else duration_matches(path, track.duration_ms)
 
 
-def download_track(job: DownloadJob, server: PlexServer, retries: int, retry_delay: float, timeout: int, output_format: str, quality: str) -> DownloadResult:
-    valid, _ = file_is_valid(job.destination, job.track, output_format)
+def download_track(job: DownloadJob, server: PlexServer, retries: int, retry_delay: float, timeout: int, conversion_formats: list[str], output_format: str, quality: str) -> DownloadResult:
+    valid, _ = file_is_valid(job.destination, job.track, conversion_formats)
     if valid:
         size = job.destination.stat().st_size if job.destination.exists() else 0
         return DownloadResult(job=job, success=True, skipped=True, bytes_written=size, elapsed=0.0, attempts=0)
 
     started = time.monotonic()
-    direct_copy = source_matches_output(job.track, output_format)
+    direct_copy = is_format_supported(job.track, conversion_formats)
     last_error = "unknown error"
 
     for attempt in range(1, retries + 1):
@@ -987,7 +1084,7 @@ def print_result(result: DownloadResult, output_root: Path) -> None:
         print(f"       ! {compact(' '.join(result.error.split()), max(10, term_width - 9))}")
 
 
-def download_jobs(jobs: list[DownloadJob], output_root: Path, server: PlexServer, retries: int, retry_delay: float, timeout: int, max_workers: int, output_format: str, quality: str) -> tuple[int, int, int]:
+def download_jobs(jobs: list[DownloadJob], output_root: Path, server: PlexServer, retries: int, retry_delay: float, timeout: int, max_workers: int, conversion_formats: list[str], output_format: str, quality: str) -> tuple[int, int, int]:
     downloaded, failed, written, interrupted = 0, 0, 0, False
     adaptive = AdaptiveConcurrency(max_workers)
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="plex")
@@ -998,7 +1095,7 @@ def download_jobs(jobs: list[DownloadJob], output_root: Path, server: PlexServer
             if interrupted:
                 break
             while pending and len(futures) < adaptive.workers:
-                futures.add(executor.submit(download_track, pending.pop(0), server, retries, retry_delay, timeout, output_format, quality))
+                futures.add(executor.submit(download_track, pending.pop(0), server, retries, retry_delay, timeout, conversion_formats, output_format, quality))
 
             if not futures:
                 break
@@ -1034,10 +1131,10 @@ def download_jobs(jobs: list[DownloadJob], output_root: Path, server: PlexServer
     return downloaded, failed, written
 
 
-def download_playlist(tracks: list[Track], playlist_name: str, output_root: Path, directory_limit: int, server: PlexServer, retries: int, retry_delay: float, timeout: int, workers: int, output_format: str, quality: str) -> tuple[int, int, int]:
+def download_playlist(tracks: list[Track], playlist_name: str, output_root: Path, directory_limit: int, server: PlexServer, retries: int, retry_delay: float, timeout: int, workers: int, conversion_formats: list[str], output_format: str, quality: str) -> tuple[int, int, int]:
     if not tracks:
         return 0, 0, 0
-    jobs = [DownloadJob(i, len(tracks), t, build_output_path(output_root, playlist_name, i, t, directory_limit)) for i, t in enumerate(tracks, 1)]
+    jobs = [DownloadJob(i, len(tracks), t, build_output_path(output_root, playlist_name, i, t, directory_limit, conversion_formats)) for i, t in enumerate(tracks, 1)]
     
     print(f"\n  {playlist_name}")
     print(f"  {'─' * min(72, display_width(playlist_name) + 2)}")
@@ -1045,10 +1142,10 @@ def download_playlist(tracks: list[Track], playlist_name: str, output_root: Path
     print(f"  Parallel:   {workers}")
     print(f"  Conversion: {output_format}" + (f":{quality}" if quality else "") + "\n")
     
-    return download_jobs(jobs, output_root, server, retries, retry_delay, timeout, workers, output_format, quality)
+    return download_jobs(jobs, output_root, server, retries, retry_delay, timeout, workers, conversion_formats, output_format, quality)
 
 
-def download_random_fill(tracks: list[Track], output_root: Path, directory_limit: int, server: PlexServer, retries: int, retry_delay: float, timeout: int, workers: int, output_format: str, quality: str) -> tuple[int, int, int]:
+def download_random_fill(tracks: list[Track], output_root: Path, directory_limit: int, server: PlexServer, retries: int, retry_delay: float, timeout: int, workers: int, conversion_formats: list[str], output_format: str, quality: str) -> tuple[int, int, int]:
     global _RANDOM_INITIAL_FREE, _RANDOM_TARGET_FILL
     candidates = select_random_tracks(tracks, output_root)
     if not candidates:
@@ -1060,7 +1157,7 @@ def download_random_fill(tracks: list[Track], output_root: Path, directory_limit
     _RANDOM_TARGET_FILL = max(1, free - reserve)
 
     random_root = output_root / "Random"
-    existing_count = sum(1 for _ in random_root.rglob("*.mp3")) if random_root.exists() else 0
+    existing_count = sum(1 for _ in random_root.rglob("*.*") if _.suffix.lower() in (".mp3", ".m4a", ".aac")) if random_root.exists() else 0
     position, cursor, downloaded, failed, written = existing_count + 1, 0, 0, 0, 0
 
     print("\n  Random")
@@ -1075,10 +1172,10 @@ def download_random_fill(tracks: list[Track], output_root: Path, directory_limit
     while cursor < len(candidates) and random_fill_space_available(output_root):
         batch = candidates[cursor : cursor + (workers * 2)]
         cursor += len(batch)
-        jobs = [DownloadJob(position + i, 0, t, build_output_path(output_root, "Random", position + i, t, directory_limit)) for i, t in enumerate(batch)]
+        jobs = [DownloadJob(position + i, 0, t, build_output_path(output_root, "Random", position + i, t, directory_limit, conversion_formats)) for i, t in enumerate(batch)]
         position += len(batch)
 
-        d, f, w = download_jobs(jobs, output_root, server, retries, retry_delay, timeout, workers, output_format, quality)
+        d, f, w = download_jobs(jobs, output_root, server, retries, retry_delay, timeout, workers, conversion_formats, output_format, quality)
         downloaded += d; failed += f; written += w
         if not random_fill_space_available(output_root):
             break
@@ -1115,6 +1212,8 @@ def main() -> int:
         retries = max(1, safe_int(config["download"].get("retries"), 3))
         retry_delay = max(0.1, float(config["download"].get("retry_delay", 2.0)))
         workers = conversion_threads(config)
+        
+        conversion_formats = config["audio"].get("conversion_formats", ["aac:vbr", "mp3:vbr"])
         output_format, quality = conversion_spec(config)
         has_random = any(t.casefold().strip() == "random" for _, t in selected)
 
@@ -1153,11 +1252,11 @@ def main() -> int:
         grand_downloaded, grand_failed, grand_written = 0, 0, 0
         for playlist_name, tracks in selected_tracks:
             if tracks:
-                d, f, w = download_playlist(tracks, playlist_name, output_root, directory_limit, server, retries, retry_delay, timeout, workers, output_format, quality)
+                d, f, w = download_playlist(tracks, playlist_name, output_root, directory_limit, server, retries, retry_delay, timeout, workers, conversion_formats, output_format, quality)
                 grand_downloaded += d; grand_failed += f; grand_written += w
 
         if random_selected:
-            d, f, w = download_random_fill(random_tracks, output_root, directory_limit, server, retries, retry_delay, timeout, workers, output_format, quality)
+            d, f, w = download_random_fill(random_tracks, output_root, directory_limit, server, retries, retry_delay, timeout, workers, conversion_formats, output_format, quality)
             grand_downloaded += d; grand_failed += f; grand_written += w
 
         print("\n" + "─" * 78)
