@@ -188,14 +188,14 @@ def unlink_quiet(path: Path) -> None:
 
 
 def display_width(text: str) -> int:
-    """Calculate terminal display column width, correctly ignoring variation selectors and zero-width joiners."""
+    """Calculate terminal display column width using standard East Asian Width rules."""
     width = 0
     for char in str(text):
         code = ord(char)
         if (0xFE00 <= code <= 0xFE0F) or (0xE0100 <= code <= 0xE01EF) or (code == 0x200D):
             continue
         ea = unicodedata.east_asian_width(char)
-        if ea in ('W', 'F') or (0x1F000 <= code <= 0x1FAFF) or (0x2600 <= code <= 0x27BF):
+        if ea in ('W', 'F'):
             width += 2
         else:
             width += 1
@@ -221,7 +221,7 @@ def compact(text: str, width: int) -> str:
     result = []
     for char in text:
         code = ord(char)
-        char_w = 0 if ((0xFE00 <= code <= 0xFE0F) or (0xE0100 <= code <= 0xE01EF) or (code == 0x200D)) else (2 if (unicodedata.east_asian_width(char) in ('W', 'F') or (0x1F000 <= code <= 0x1FAFF) or (0x2600 <= code <= 0x27BF)) else 1)
+        char_w = 0 if ((0xFE00 <= code <= 0xFE0F) or (0xE0100 <= code <= 0xE01EF) or (code == 0x200D)) else (2 if unicodedata.east_asian_width(char) in ('W', 'F') else 1)
         if current_w + char_w + 1 > width:
             break
         result.append(char)
