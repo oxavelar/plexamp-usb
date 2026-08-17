@@ -1,31 +1,24 @@
 #!/usr/bin/env python3
 """Export Plex music to a car-friendly USB filesystem.
 
-The program discovers a reachable Plex Media Server, authenticates only when
-local unauthenticated access is unavailable, lets the user select Plex music
-playlists, and exports tracks directly below a Downloads directory beside
-this script.
+Discovers a reachable Plex Media Server, authenticates when unauthenticated
+access is unavailable, selects music playlists, and exports tracks directly
+into a local Downloads directory.
 
-Supported source formats are copied directly when they match any format in
-the configured conversion/supported list. Other formats are converted using
-FFmpeg exclusively to the top choice in order (defaulting to AAC-LC VBR
-highest quality).
+Supported source formats are copied directly when matching configured formats.
+All other formats are converted using FFmpeg to the top-priority target
+format (defaulting to AAC-LC VBR highest quality).
 
-Downloads are deterministic and resumable. Existing complete files are kept;
-incomplete, invalid, or mismatched files are replaced and retried.
+Operations are deterministic and resumable. Complete files are preserved, while
+stale, incomplete, or invalid files are cleaned up or retried automatically.
+Playlists and random-fill folders prune orphaned files during refreshes while
+retaining pending or active targets.
 
-Directories can be capped at a user-selected number of audio files. A value
-of -1 disables the limit.
-
-A playlist named "Random" is treated as a special fill mode. Tracks are
-sampled from the complete Plex music library and downloaded until the
-destination filesystem reaches its safety threshold (1% of total capacity).
-
-Configuration is stored in settings.json beside this script.
+Configuration is maintained in settings.json alongside this script.
 
 Requirements:
     - Python 3.10+
-    - ffmpeg and ffprobe when conversion is required
+    - ffmpeg and ffprobe for audio conversion
 """
 
 from __future__ import annotations
@@ -136,7 +129,7 @@ class DownloadResult:
 
 
 class AdaptiveConcurrency:
-    """Dynamically adjust download concurrency."""
+    """Dynamically adjust worker concurrency based on throughput performance."""
 
     def __init__(self, maximum: int) -> None:
         self.maximum = max(ADAPTIVE_MIN_WORKERS, int(maximum))
@@ -783,7 +776,7 @@ def free_space(path: Path) -> int:
 
 
 def get_disk_stats(path: Path) -> tuple[int, int]:
-    """Return (free_space, reserve_1_percent)."""
+    """Retrieve available free space and 1% safety reserve."""
     try:
         usage = shutil.disk_usage(path)
         return usage.free, usage.total // 100
@@ -800,21 +793,68 @@ def track_identity(track: Track) -> str:
     return "|".join((sanitize_filename(track.artist, "").casefold(), sanitize_filename(track.album, "").casefold(), sanitize_filename(track.title, "").casefold()))
 
 
-def exported_track_keys(output_root: Path) -> set[str]:
-    keys = set()
-    if output_root.exists():
-        for path in output_root.rglob("*.*"):
-            if path.suffix.lower() in (".mp3", ".m4a", ".aac", ".flac", ".ogg"):
-                parts = path.stem.split(" - ", 3)
-                if len(parts) == 4:
-                    _, artist, album, title = parts
-                    keys.add("|".join((artist.casefold().strip(), album.casefold().strip(), title.casefold().strip())))
-    return keys
+def cleanup_playlist_leftovers(output_root: Path, playlist_name: str, tracks: list[Track], directory_limit: int, conversion_formats: list[str]) -> None:
+    """Prune stale files in the playlist directory that no longer match the current track list."""
+    playlist_root = output_root / sanitize_filename(playlist_name, "Music")
+    if not playlist_root.exists():
+        return
+
+    expected_paths = {
+        build_output_path(output_root, playlist_name, i, t, directory_limit, conversion_formats).resolve()
+        for i, t in enumerate(tracks, 1)
+    }
+
+    for path in playlist_root.rglob("*.*"):
+        if path.is_file() and path.suffix.lower() in (".mp3", ".m4a", ".aac", ".flac", ".ogg"):
+            if path.resolve() not in expected_paths:
+                unlink_quiet(path)
+
+    for dirpath, _, _ in os.walk(playlist_root, topdown=False):
+        d = Path(dirpath)
+        if d != playlist_root and not any(d.iterdir()):
+            with contextlib.suppress(OSError):
+                d.rmdir()
+
+
+def cleanup_random_fill_leftovers(output_root: Path, all_library_tracks: list[Track]) -> None:
+    """Prune orphaned tracks in the Random directory that no longer exist in the Plex library."""
+    random_root = output_root / "Random"
+    if not random_root.exists():
+        return
+
+    valid_keys = {track_identity(t) for t in all_library_tracks}
+
+    for path in random_root.rglob("*.*"):
+        if path.is_file() and path.suffix.lower() in (".mp3", ".m4a", ".aac", ".flac", ".ogg"):
+            parts = path.stem.split(" - ", 3)
+            if len(parts) == 4:
+                _, artist, album, title = parts
+                key = "|".join((artist.casefold().strip(), album.casefold().strip(), title.casefold().strip()))
+                if key not in valid_keys:
+                    unlink_quiet(path)
+
+    for dirpath, _, _ in os.walk(random_root, topdown=False):
+        d = Path(dirpath)
+        if d != random_root and not any(d.iterdir()):
+            with contextlib.suppress(OSError):
+                d.rmdir()
 
 
 def select_random_tracks(tracks: list[Track], output_root: Path) -> list[Track]:
-    existing = exported_track_keys(output_root)
-    candidates = [t for t in tracks if track_identity(t) not in existing]
+    """Prune library-orphaned files while retaining active candidates and previously downloaded tracks."""
+    cleanup_random_fill_leftovers(output_root, tracks)
+
+    existing_keys = set()
+    random_root = output_root / "Random"
+    if random_root.exists():
+        for path in random_root.rglob("*.*"):
+            if path.is_file() and path.suffix.lower() in (".mp3", ".m4a", ".aac", ".flac", ".ogg"):
+                parts = path.stem.split(" - ", 3)
+                if len(parts) == 4:
+                    _, artist, album, title = parts
+                    existing_keys.add("|".join((artist.casefold().strip(), album.casefold().strip(), title.casefold().strip())))
+
+    candidates = [t for t in tracks if track_identity(t) not in existing_keys]
     random.SystemRandom().shuffle(candidates)
     return candidates
 
@@ -1137,6 +1177,9 @@ def download_jobs(jobs: list[DownloadJob], output_root: Path, server: PlexServer
 def download_playlist(tracks: list[Track], playlist_name: str, output_root: Path, directory_limit: int, server: PlexServer, retries: int, retry_delay: float, timeout: int, workers: int, conversion_formats: list[str], output_format: str, quality: str) -> tuple[int, int, int]:
     if not tracks:
         return 0, 0, 0
+
+    cleanup_playlist_leftovers(output_root, playlist_name, tracks, directory_limit, conversion_formats)
+
     jobs = [DownloadJob(i, len(tracks), t, build_output_path(output_root, playlist_name, i, t, directory_limit, conversion_formats)) for i, t in enumerate(tracks, 1)]
     
     print(f"\n  {playlist_name}")
