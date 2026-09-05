@@ -800,7 +800,23 @@ def random_fill_space_available(output_root: Path) -> bool:
 
 
 def track_identity(track: Track) -> str:
-    return "|".join((sanitize_filename(track.artist, "").casefold(), sanitize_filename(track.album, "").casefold(), sanitize_filename(track.title, "").casefold()))
+    return "|".join((
+        sanitize_filename(track.artist, "Unknown Artist").casefold(),
+        sanitize_filename(track.album, "Unknown Album").casefold(),
+        sanitize_filename(track.title, "Unknown Track").casefold(),
+    ))
+
+
+def parse_file_identity(path: Path) -> str | None:
+    """Extract track identity (artist|album|title) from a target audio file stem."""
+    parts = path.stem.split(" - ", 3)
+    if len(parts) == 4:
+        _, artist, album, title = parts
+        return "|".join((artist.casefold().strip(), album.casefold().strip(), title.casefold().strip()))
+    elif len(parts) == 3:
+        artist, album, title = parts
+        return "|".join((artist.casefold().strip(), album.casefold().strip(), title.casefold().strip()))
+    return None
 
 
 def cleanup_playlist_leftovers(output_root: Path, playlist_name: str, tracks: list[Track], directory_limit: int, conversion_formats: list[str]) -> None:
@@ -826,22 +842,25 @@ def cleanup_playlist_leftovers(output_root: Path, playlist_name: str, tracks: li
                 d.rmdir()
 
 
-def cleanup_random_fill_leftovers(output_root: Path, all_library_tracks: list[Track]) -> None:
-    """Prune orphaned tracks in the Random directory that no longer exist in the Plex library."""
+def cleanup_random_fill_leftovers(
+    output_root: Path,
+    all_library_tracks: list[Track],
+    excluded_identities: set[str] | None = None,
+) -> None:
+    """Prune orphaned tracks in the Random directory that no longer exist in the Plex library or are already in exported playlists."""
     random_root = output_root / "Random"
     if not random_root.exists():
         return
 
     valid_keys = {track_identity(t) for t in all_library_tracks}
+    if excluded_identities:
+        valid_keys -= excluded_identities
 
     for path in random_root.rglob("*.*"):
         if path.is_file() and path.suffix.lower() in (".mp3", ".m4a", ".aac", ".flac", ".ogg"):
-            parts = path.stem.split(" - ", 3)
-            if len(parts) == 4:
-                _, artist, album, title = parts
-                key = "|".join((artist.casefold().strip(), album.casefold().strip(), title.casefold().strip()))
-                if key not in valid_keys:
-                    unlink_quiet(path)
+            key = parse_file_identity(path)
+            if key and key not in valid_keys:
+                unlink_quiet(path)
 
     for dirpath, _, _ in os.walk(random_root, topdown=False):
         d = Path(dirpath)
@@ -850,23 +869,39 @@ def cleanup_random_fill_leftovers(output_root: Path, all_library_tracks: list[Tr
                 d.rmdir()
 
 
-def select_random_tracks(tracks: list[Track], output_root: Path) -> list[Track]:
-    """Prune library-orphaned files while retaining active candidates and previously downloaded tracks."""
-    cleanup_random_fill_leftovers(output_root, tracks)
-
-    existing_keys = set()
+def get_existing_random_identities_and_count(output_root: Path) -> tuple[set[str], int]:
+    """Return existing track identities in Random directory and total valid file count."""
     random_root = output_root / "Random"
+    existing_keys = set()
+    count = 0
     if random_root.exists():
         for path in random_root.rglob("*.*"):
             if path.is_file() and path.suffix.lower() in (".mp3", ".m4a", ".aac", ".flac", ".ogg"):
-                parts = path.stem.split(" - ", 3)
-                if len(parts) == 4:
-                    _, artist, album, title = parts
-                    existing_keys.add("|".join((artist.casefold().strip(), album.casefold().strip(), title.casefold().strip())))
+                count += 1
+                key = parse_file_identity(path)
+                if key:
+                    existing_keys.add(key)
+    return existing_keys, count
+
+
+def select_random_tracks(
+    tracks: list[Track],
+    output_root: Path,
+    excluded_identities: set[str] | None = None,
+) -> tuple[list[Track], int]:
+    """Prune library-orphaned files while retaining active candidates and previously downloaded tracks.
+
+    Returns candidate tracks for Random fill and the starting position index for new tracks.
+    """
+    cleanup_random_fill_leftovers(output_root, tracks, excluded_identities)
+
+    existing_keys, existing_count = get_existing_random_identities_and_count(output_root)
+    if excluded_identities:
+        existing_keys.update(excluded_identities)
 
     candidates = [t for t in tracks if track_identity(t) not in existing_keys]
     random.SystemRandom().shuffle(candidates)
-    return candidates
+    return candidates, existing_count + 1
 
 
 def ffmpeg_command(track: Track, output: Path, token: str, output_format: str, quality: str) -> list[str]:
@@ -1116,17 +1151,23 @@ def main() -> None:
     if has_random:
         print("\n--- Random Fill Mode ---")
         lib_tracks = fetch_library_tracks(server, library_key, timeout=timeout)
-        random_candidates = select_random_tracks(lib_tracks, output_root)
+        playlist_track_identities = {track_identity(job.track) for job in all_jobs}
+
+        random_candidates, start_position = select_random_tracks(
+            lib_tracks, output_root, excluded_identities=playlist_track_identities
+        )
         random_root = output_root / "Random"
         random_root.mkdir(parents=True, exist_ok=True)
 
         random_jobs: list[DownloadJob] = []
-        for idx, track in enumerate(random_candidates, 1):
+        position = start_position
+        for track in random_candidates:
             if not random_fill_space_available(output_root):
                 print("  Disk space safety limit reached for Random Fill.")
                 break
-            dest = random_root / track_filename(track, idx, output_format)
-            random_jobs.append(DownloadJob(index=idx, total=len(random_candidates), track=track, destination=dest))
+            dest = build_output_path(output_root, "Random", position, track, directory_limit, conversion_formats)
+            random_jobs.append(DownloadJob(index=position, total=len(random_candidates) + start_position - 1, track=track, destination=dest))
+            position += 1
 
         if random_jobs:
             random_results = process_download_queue(
