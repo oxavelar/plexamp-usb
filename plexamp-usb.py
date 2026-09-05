@@ -31,9 +31,11 @@ import os
 import random
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -69,6 +71,7 @@ DEFAULT_CONFIG = {
     "output": {
         "directory": DOWNLOAD_DIR,
         "directory_limit": 255,
+        "reserve": "5%",  # Can be "5%", "128M", "2G", "500K", or raw bytes
     },
     "download": {
         "retries": 3,
@@ -76,9 +79,45 @@ DEFAULT_CONFIG = {
     },
 }
 
-_RANDOM_INITIAL_FREE = 0
-_RANDOM_TARGET_FILL = 0
 _HAS_FDK_AAC: bool | None = None
+
+ACTIVE_PROCESSES: set[subprocess.Popen] = set()
+ACTIVE_PART_FILES: set[Path] = set()
+TRACK_LOCK = threading.Lock()
+
+
+def _register_part_file(path: Path) -> None:
+    with TRACK_LOCK:
+        ACTIVE_PART_FILES.add(path)
+
+
+def _unregister_part_file(path: Path) -> None:
+    with TRACK_LOCK:
+        ACTIVE_PART_FILES.discard(path)
+
+
+def _register_process(proc: subprocess.Popen) -> None:
+    with TRACK_LOCK:
+        ACTIVE_PROCESSES.add(proc)
+
+
+def _unregister_process(proc: subprocess.Popen) -> None:
+    with TRACK_LOCK:
+        ACTIVE_PROCESSES.discard(proc)
+
+
+def handle_sigint(signum: int, frame: Any) -> None:
+    print("\r\033[K\nOperation cancelled by user.")
+    with TRACK_LOCK:
+        for proc in list(ACTIVE_PROCESSES):
+            with contextlib.suppress(OSError):
+                proc.kill()
+        for path in list(ACTIVE_PART_FILES):
+            unlink_quiet(path)
+    os._exit(130)
+
+
+signal.signal(signal.SIGINT, handle_sigint)
 
 
 @dataclass(frozen=True)
@@ -189,6 +228,53 @@ def safe_float(value: Any, default: float = 0.0) -> float:
 def unlink_quiet(path: Path) -> None:
     with contextlib.suppress(OSError):
         path.unlink(missing_ok=True)
+
+
+def parse_reserve(reserve_setting: Any, total_bytes: int) -> int:
+    """Parses a reserve setting (e.g., '5%', '128M', '2G', '500K') into raw bytes."""
+    if isinstance(reserve_setting, (int, float)):
+        return int(reserve_setting)
+
+    res = str(reserve_setting or "5%").strip().upper().replace(" ", "")
+
+    if res.endswith("%"):
+        pct = safe_float(res[:-1], 5.0)
+        return int(total_bytes * (pct / 100.0))
+
+    units = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+    for unit, multiplier in units.items():
+        if res.endswith(unit) or res.endswith(unit + "B"):
+            number_part = res.rstrip("B").rstrip(unit)
+            return int(safe_float(number_part) * multiplier)
+
+    return safe_int(res)
+
+
+def resolve_existing_path(path: Path) -> Path:
+    """Traverse up to the nearest existing parent directory on the filesystem."""
+    target = path.resolve()
+    while not target.exists() and target.parent != target:
+        target = target.parent
+    return target
+
+
+def free_space(path: Path) -> int:
+    target = resolve_existing_path(path)
+    try:
+        return shutil.disk_usage(target).free
+    except OSError:
+        return 0
+
+
+def get_disk_stats(path: Path, reserve_setting: Any = "5%") -> tuple[int, int, int]:
+    """Retrieve free space, total space, and calculated reserve bytes for an existing mount path."""
+    target = resolve_existing_path(path)
+    try:
+        usage = shutil.disk_usage(target)
+        reserve_bytes = parse_reserve(reserve_setting, usage.total)
+        return usage.free, usage.total, reserve_bytes
+    except OSError:
+        return free_space(target), 0, 0
 
 
 def display_width(text: str) -> int:
@@ -778,27 +864,6 @@ def has_libfdk_aac() -> bool:
     return _HAS_FDK_AAC
 
 
-def free_space(path: Path) -> int:
-    try:
-        return shutil.disk_usage(path).free
-    except OSError:
-        return 0
-
-
-def get_disk_stats(path: Path) -> tuple[int, int]:
-    """Retrieve available free space and 1% safety reserve."""
-    try:
-        usage = shutil.disk_usage(path)
-        return usage.free, usage.total // 100
-    except OSError:
-        return free_space(path), 0
-
-
-def random_fill_space_available(output_root: Path) -> bool:
-    free, reserve = get_disk_stats(output_root)
-    return free > reserve
-
-
 def track_identity(track: Track) -> str:
     return "|".join((
         sanitize_filename(track.artist, "Unknown Artist").casefold(),
@@ -949,23 +1014,27 @@ def download_direct(job: DownloadJob, token: str, timeout: int = 30) -> int:
     job.destination.parent.mkdir(parents=True, exist_ok=True)
     unlink_quiet(temp_path)
 
+    _register_part_file(temp_path)
     headers = {"User-Agent": f"{APP_NAME}/1.0"}
     if token:
         headers["X-Plex-Token"] = token
 
     req = urllib.request.Request(job.track.media_url, headers=headers)
     bytes_written = 0
-    with urllib.request.urlopen(req, timeout=timeout) as response, temp_path.open("wb") as handle:
-        while chunk := response.read(64 * 1024):
-            handle.write(chunk)
-            bytes_written += len(chunk)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response, temp_path.open("wb") as handle:
+            while chunk := response.read(64 * 1024):
+                handle.write(chunk)
+                bytes_written += len(chunk)
 
-    if bytes_written == 0:
-        unlink_quiet(temp_path)
-        raise RuntimeError("Downloaded file is empty.")
+        if bytes_written == 0:
+            unlink_quiet(temp_path)
+            raise RuntimeError("Downloaded file is empty.")
 
-    os.replace(temp_path, job.destination)
-    return bytes_written
+        os.replace(temp_path, job.destination)
+        return bytes_written
+    finally:
+        _unregister_part_file(temp_path)
 
 
 def convert_track(job: DownloadJob, token: str, output_format: str, quality: str) -> int:
@@ -973,17 +1042,24 @@ def convert_track(job: DownloadJob, token: str, output_format: str, quality: str
     job.destination.parent.mkdir(parents=True, exist_ok=True)
     unlink_quiet(temp_path)
 
+    _register_part_file(temp_path)
     cmd = ffmpeg_command(job.track, temp_path, token, output_format, quality)
-    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, check=False)
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        _register_process(proc)
+        _, stderr_data = proc.communicate()
+        _unregister_process(proc)
 
-    if proc.returncode != 0 or not temp_path.exists() or temp_path.stat().st_size == 0:
-        unlink_quiet(temp_path)
-        err = proc.stderr.strip() if proc.stderr else "FFmpeg conversion failed"
-        raise RuntimeError(err)
+        if proc.returncode != 0 or not temp_path.exists() or temp_path.stat().st_size == 0:
+            unlink_quiet(temp_path)
+            err = stderr_data.strip() if stderr_data else "FFmpeg conversion failed"
+            raise RuntimeError(err)
 
-    bytes_written = temp_path.stat().st_size
-    os.replace(temp_path, job.destination)
-    return bytes_written
+        bytes_written = temp_path.stat().st_size
+        os.replace(temp_path, job.destination)
+        return bytes_written
+    finally:
+        _unregister_part_file(temp_path)
 
 
 def download_track(
@@ -1042,46 +1118,92 @@ def process_download_queue(
     max_workers: int,
     retries: int,
     retry_delay: float,
-) -> list[DownloadResult]:
+    reserve_bytes: int = 0,
+) -> tuple[list[DownloadResult], bool]:
+    """Processes download jobs with dynamic concurrency and active reserve checking.
+
+    Returns a tuple of (results, stopped_on_reserve_flag).
+    """
     if not jobs:
-        return []
+        return [], False
 
     adaptive = AdaptiveConcurrency(max_workers)
     results: list[DownloadResult] = []
     completed = 0
+    skipped_count = 0
     total = len(jobs)
     start_time = time.monotonic()
     total_bytes = 0
+    stopped_on_reserve = False
 
-    print(f"\nProcessing {total:,} track(s) using up to {max_workers} worker(s)...\n")
+    print(f"\nProcessing {total:,} track(s) using up to {max_workers} worker(s)...")
 
     def _execute_job(j: DownloadJob) -> DownloadResult:
         return download_track(j, token, output_format, quality, retries, retry_delay)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_execute_job, job): job for job in jobs}
+        job_iter = iter(jobs)
+        futures: dict[concurrent.futures.Future, DownloadJob] = {}
 
-        for future in concurrent.futures.as_completed(futures):
-            res = future.result()
-            results.append(res)
-            completed += 1
-            if not res.skipped and res.success:
-                total_bytes += res.bytes_written
-                adaptive.success()
-            elif not res.success:
-                adaptive.failure()
+        def _submit_next() -> bool:
+            nonlocal stopped_on_reserve
+            try:
+                job = next(job_iter)
+            except StopIteration:
+                return False
 
-            elapsed = time.monotonic() - start_time
-            rate = total_bytes / elapsed if elapsed > 0 else 0
-            status_line = (
-                f" [{completed/total*100:5.1f}%] {completed}/{total} | "
-                f"{human_size(total_bytes)} | {human_rate(rate)} | "
-                f"Track: {compact(res.job.track.title, 25)}"
-            )
-            print(f"\r{pad_right(status_line, 80)}", end="", flush=True)
+            if reserve_bytes > 0:
+                target_dir = job.destination.parent
+                if free_space(target_dir) <= reserve_bytes:
+                    stopped_on_reserve = True
+                    return False
 
-    print()
-    return results
+            fut = executor.submit(_execute_job, job)
+            futures[fut] = job
+            return True
+
+        for _ in range(max_workers):
+            if not _submit_next():
+                break
+
+        while futures:
+            done, _ = concurrent.futures.wait(futures.keys(), timeout=0.2, return_when=concurrent.futures.FIRST_COMPLETED)
+            if not done:
+                continue
+
+            for fut in done:
+                res = fut.result()
+                del futures[fut]
+                results.append(res)
+                completed += 1
+
+                if res.skipped:
+                    skipped_count += 1
+                elif res.success:
+                    total_bytes += res.bytes_written
+                    adaptive.success()
+                else:
+                    adaptive.failure()
+
+                elapsed = time.monotonic() - start_time
+                rate = total_bytes / elapsed if elapsed > 0 else 0
+                skip_str = f" ({skipped_count:,} skipped)" if skipped_count > 0 else ""
+                status_line = (
+                    f" [{completed/total*100:5.1f}%] {completed}/{total}{skip_str} | "
+                    f"{human_size(total_bytes)} | {human_rate(rate)} | "
+                    f"Track: {compact(res.job.track.title, 25)}"
+                )
+                print(f"\r\033[K{status_line}", end="", flush=True)
+
+                if not stopped_on_reserve:
+                    _submit_next()
+
+    if skipped_count == total:
+        print(f"\r\033[K  ✓ All {total:,} tracks are already up to date.")
+    else:
+        print(f"\r\033[K  ✓ Processed {total:,} tracks ({human_size(total_bytes)} downloaded, {skipped_count:,} skipped).")
+
+    return results, stopped_on_reserve
 
 
 def main() -> None:
@@ -1106,7 +1228,7 @@ def main() -> None:
 
     print("\n--- Music Library ---")
     library_key, library_title = select_music_library(server, timeout=timeout)
-    print(f"  Selected: {library_title}")
+    print(f"  Selected: {library_title}\n")
 
     playlists = get_playlists(server, timeout=timeout)
     output_root = Path(config["output"].get("directory", DOWNLOAD_DIR)).resolve()
@@ -1115,6 +1237,9 @@ def main() -> None:
     directory_limit = safe_int(config["output"].get("directory_limit"), 255)
     if directory_limit not in (-1, 255):
         directory_limit = choose_directory_limit()
+
+    reserve_setting = config["output"].get("reserve", "5%")
+    _, _, reserve_bytes = get_disk_stats(output_root, reserve_setting)
 
     output_format, quality = conversion_spec(config)
     conversion_formats = config["audio"].get("conversion_formats", ["aac:vbr"])
@@ -1130,7 +1255,7 @@ def main() -> None:
             has_random = True
             continue
 
-        print(f"\nFetching tracks for playlist: {title}...")
+        print(f"Fetching tracks for playlist: {title}...")
         tracks = fetch_playlist_tracks(server, rk, timeout=timeout)
         cleanup_playlist_leftovers(output_root, title, tracks, directory_limit, conversion_formats)
 
@@ -1138,7 +1263,7 @@ def main() -> None:
             dest = build_output_path(output_root, title, idx, track, directory_limit, conversion_formats)
             all_jobs.append(DownloadJob(index=idx, total=len(tracks), track=track, destination=dest))
 
-    results = process_download_queue(
+    results, stopped_on_reserve = process_download_queue(
         all_jobs,
         token=server.token,
         output_format=output_format,
@@ -1146,10 +1271,11 @@ def main() -> None:
         max_workers=max_workers,
         retries=retries,
         retry_delay=retry_delay,
+        reserve_bytes=reserve_bytes,
     )
 
-    if has_random:
-        print("\n--- Random Fill Mode ---")
+    if has_random and not stopped_on_reserve:
+        print("\nFetching tracks for library (Random Fill)...")
         lib_tracks = fetch_library_tracks(server, library_key, timeout=timeout)
         playlist_track_identities = {track_identity(job.track) for job in all_jobs}
 
@@ -1162,15 +1288,12 @@ def main() -> None:
         random_jobs: list[DownloadJob] = []
         position = start_position
         for track in random_candidates:
-            if not random_fill_space_available(output_root):
-                print("  Disk space safety limit reached for Random Fill.")
-                break
             dest = build_output_path(output_root, "Random", position, track, directory_limit, conversion_formats)
             random_jobs.append(DownloadJob(index=position, total=len(random_candidates) + start_position - 1, track=track, destination=dest))
             position += 1
 
         if random_jobs:
-            random_results = process_download_queue(
+            rand_results, rand_stopped_reserve = process_download_queue(
                 random_jobs,
                 token=server.token,
                 output_format=output_format,
@@ -1178,8 +1301,11 @@ def main() -> None:
                 max_workers=max_workers,
                 retries=retries,
                 retry_delay=retry_delay,
+                reserve_bytes=reserve_bytes,
             )
-            results.extend(random_results)
+            results.extend(rand_results)
+            if rand_stopped_reserve:
+                stopped_on_reserve = True
 
     successes = [r for r in results if r.success and not r.skipped]
     skipped = [r for r in results if r.skipped]
@@ -1189,20 +1315,19 @@ def main() -> None:
     total_time = sum(r.elapsed for r in results)
 
     print("\n--- Summary ---")
-    print(f"  Downloaded: {len(successes):,} tracks ({human_size(total_bytes)})")
-    print(f"  Skipped:    {len(skipped):,} tracks (already present)")
-    print(f"  Failed:     {len(failures):,} tracks")
+    print(f"  Downloaded:         {len(successes):,} tracks ({human_size(total_bytes)})")
+    print(f"  Skipped:            {len(skipped):,} tracks (already present)")
+    print(f"  Failed:             {len(failures):,} tracks")
+    if stopped_on_reserve:
+        print(f"  Stopped on Reserve: Yes ({reserve_setting} / {human_size(reserve_bytes)} safety limit reached)")
     if total_time > 0:
-        print(f"  Total time: {human_duration(int(total_time * 1000))}")
+        print(f"  Total time:         {human_duration(int(total_time * 1000))}")
     print("\nDone.")
 
 
 if __name__ == "__main__":
     try:
         main()
-    except KeyboardInterrupt:
-        print("\nOperation cancelled by user.")
-        sys.exit(130)
     except Exception as exc:
         print(f"\nError: {exc}", file=sys.stderr)
         sys.exit(1)
