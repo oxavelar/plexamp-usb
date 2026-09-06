@@ -1029,6 +1029,11 @@ def download_direct(job: DownloadJob, token: str, timeout: int = 30) -> int:
             unlink_quiet(temp_path)
             raise RuntimeError("Downloaded file is empty.")
 
+        # Validate against Plex source size to catch truncated downloads
+        if job.track.source_size > 0 and bytes_written != job.track.source_size:
+            unlink_quiet(temp_path)
+            raise RuntimeError(f"Download truncated: expected {job.track.source_size:,} bytes, got {bytes_written:,} bytes.")
+
         os.replace(temp_path, job.destination)
         return bytes_written
     finally:
@@ -1068,8 +1073,12 @@ def download_track(
     retries: int = 3,
     retry_delay: float = 2.0,
 ) -> DownloadResult:
+    # Re-download if file exists but is size-mismatched (truncated from a previous run)
     if job.destination.exists() and job.destination.stat().st_size > 0:
-        return DownloadResult(job=job, success=True, skipped=True, bytes_written=0, elapsed=0.0, attempts=0)
+        if job.track.source_size <= 0 or job.destination.stat().st_size == job.track.source_size:
+            return DownloadResult(job=job, success=True, skipped=True, bytes_written=0, elapsed=0.0, attempts=0)
+        else:
+            unlink_quiet(job.destination)
 
     start_time = time.monotonic()
     last_error = ""
@@ -1110,11 +1119,11 @@ def download_track(
 
 def render_progress_bar(completed: int, total: int, width: int = 20) -> str:
     if total <= 0:
-        return "[" + " " * width + "]"
+        return " " * width
     filled_len = int(round(width * completed / total))
     filled_len = max(0, min(width, filled_len))
     bar = "█" * filled_len + "░" * (width - filled_len)
-    return f"[{bar}]"
+    return bar
 
 
 def process_download_queue(
@@ -1184,7 +1193,6 @@ def process_download_queue(
             eta_str = human_duration(int(eta_secs * 1000))
 
         term_width = shutil.get_terminal_size((80, 24)).columns
-        # Use term_width - 2 to strictly prevent terminal auto-wrap on the right margin
         safe_width = max(10, term_width - 2)
 
         bar_width = 12 if safe_width < 60 else 20
@@ -1197,7 +1205,10 @@ def process_download_queue(
         line1_raw = f" {bar_str} [{pct:5.1f}%] {completed}/{total}{skip_str} | {human_size(total_bytes)} | {human_rate(rate)} | ETA: {eta_str}"
         line1 = pad_right(truncate_to_width(line1_raw, safe_width), safe_width)
 
-        active_desc = "; ".join(current_active[:3]) if current_active else "Idle / finalizing..."
+        if len(current_active) > 3:
+            active_desc = "; ".join(current_active[:3]) + "…"
+        else:
+            active_desc = "; ".join(current_active) if current_active else "Idle / finalizing..."
         line2_raw = f" Active: {active_desc}"
         line2 = pad_right(truncate_to_width(line2_raw, safe_width), safe_width)
 
