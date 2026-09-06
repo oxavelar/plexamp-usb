@@ -482,7 +482,7 @@ def prompt_user(server: PlexServer, config: dict, path: Path = CONFIG_PATH) -> s
         print(f"  User:    {configured_user}")
         return configured_user
 
-    print("  Discovering Plex users...")
+    print("  Discovering Plex users…")
     users = get_users(server, timeout=timeout)
 
     if not users:
@@ -571,7 +571,7 @@ def prompt_server(config: dict, path: Path = CONFIG_PATH) -> PlexServer:
             return PlexServer(name=name, host=configured_host, port=configured_port, token=configured_token)
         print(f"  Configured server unavailable: {configured.base_url}")
 
-    print("  Discovering local Plex servers...")
+    print("  Discovering local Plex servers…")
     servers = discover_gdm_servers()
 
     if not servers:
@@ -1151,7 +1151,7 @@ def process_download_queue(
     active_jobs_map: dict[int, str] = {}
     active_lock = threading.Lock()
 
-    term_print(f"\nProcessing {total:,} track(s) using up to {max_workers} worker(s)...")
+    term_print(f"\nProcessing {total:,} track(s) using up to {max_workers} worker(s)…")
 
     def _execute_job(j: DownloadJob) -> DownloadResult:
         thread_id = threading.get_ident()
@@ -1202,19 +1202,26 @@ def process_download_queue(
         with active_lock:
             current_active = list(active_jobs_map.values())
 
-        line1_raw = f" {bar_str} [{pct:5.1f}%] {completed}/{total}{skip_str} | {human_size(total_bytes)} | {human_rate(rate)} | ETA: {eta_str}"
+        line1_raw = f" {bar_str} {pct:5.1f}% {completed}/{total}{skip_str} | {human_size(total_bytes)} | {human_rate(rate)} | ETA: {eta_str}"
         line1 = pad_right(truncate_to_width(line1_raw, safe_width), safe_width)
 
-        if len(current_active) > 3:
-            active_desc = "; ".join(current_active[:3]) + "…"
+        if current_active:
+            if len(current_active) > 3:
+                active_desc = "; ".join(current_active[:3]) + "…"
+            else:
+                active_desc = "; ".join(current_active)
+            line2_raw = f" Active: {active_desc}"
+            line2 = pad_right(truncate_to_width(line2_raw, safe_width), safe_width)
+            has_active = True
         else:
-            active_desc = "; ".join(current_active) if current_active else "Idle / finalizing..."
-        line2_raw = f" Active: {active_desc}"
-        line2 = pad_right(truncate_to_width(line2_raw, safe_width), safe_width)
+            has_active = False
 
         with print_lock:
             sys.stdout.write("\033[u")  # Restore cursor to saved top position
-            sys.stdout.write(f"\033[K{line1}\n\033[K{line2}")
+            if has_active:
+                sys.stdout.write(f"\033[K{line1}\n\033[K{line2}")
+            else:
+                sys.stdout.write(f"\033[K{line1}\n\033[K")
             sys.stdout.flush()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1267,7 +1274,7 @@ def process_download_queue(
 
     render_progress(force=True)
     with print_lock:
-        sys.stdout.write("\n\n")  # Move cursor past the 2 status lines
+        sys.stdout.write("\n")  # Move cursor past the final rendered line
         sys.stdout.flush()
 
     if skipped_count == total:
@@ -1327,7 +1334,7 @@ def main() -> None:
             has_random = True
             continue
 
-        term_print(f"Fetching tracks for playlist: {title}...")
+        term_print(f"Fetching tracks for playlist: {title}…")
         tracks = fetch_playlist_tracks(server, rk, timeout=timeout)
         cleanup_playlist_leftovers(output_root, title, tracks, directory_limit, conversion_formats)
 
@@ -1347,7 +1354,7 @@ def main() -> None:
     )
 
     if has_random and not stopped_on_reserve:
-        term_print("\nFetching tracks for library (Random Fill)...")
+        term_print("\nFetching tracks for library (Random Fill)…")
         lib_tracks = fetch_library_tracks(server, library_key, timeout=timeout)
         playlist_track_identities = {track_identity(job.track) for job in all_jobs}
 
