@@ -288,12 +288,6 @@ def display_width(text: str) -> int:
     return width
 
 
-def pad_right(text: str, total_width: int) -> str:
-    text_str = str(text)
-    w = display_width(text_str)
-    return text_str + " " * max(0, total_width - w)
-
-
 def compact(text: str, width: int) -> str:
     text_str = str(text)
     if display_width(text_str) <= width:
@@ -873,15 +867,40 @@ def track_identity(track: Track) -> str:
 
 
 def parse_file_identity(path: Path) -> str | None:
-    """Extract track identity (artist|album|title) from a target audio file stem."""
-    parts = path.stem.split(" - ", 3)
+    """Extract track identity (artist|album|title) from a target audio file stem safely using right-to-left split."""
+    stem = path.stem
+    parts = stem.rsplit(" - ", 3)
     if len(parts) == 4:
         _, artist, album, title = parts
         return "|".join((artist.casefold().strip(), album.casefold().strip(), title.casefold().strip()))
-    elif len(parts) == 3:
-        artist, album, title = parts
+    parts_3 = stem.rsplit(" - ", 2)
+    if len(parts_3) == 3:
+        artist, album, title = parts_3
         return "|".join((artist.casefold().strip(), album.casefold().strip(), title.casefold().strip()))
     return None
+
+
+def file_is_valid(path: Path, expected_duration_ms: int) -> bool:
+    """Validate file existence, non-zero size, and audio duration against metadata tolerance using ffprobe."""
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    if expected_duration_ms <= 0:
+        return True
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprintwrappers=1:nokey=1",
+            str(path)
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        if res.returncode != 0 or not res.stdout.strip():
+            return False
+        actual_seconds = float(res.stdout.strip())
+        expected_seconds = expected_duration_ms / 1000.0
+        return abs(actual_seconds - expected_seconds) <= DURATION_TOLERANCE_SECONDS
+    except Exception:
+        return False
 
 
 def cleanup_playlist_leftovers(output_root: Path, playlist_name: str, tracks: list[Track], directory_limit: int, conversion_formats: list[str]) -> None:
@@ -986,7 +1005,9 @@ def ffmpeg_command(track: Track, output: Path, token: str, output_format: str, q
     cmd.extend(["-i", track.media_url, "-vn", "-map", "0:a:0", "-map_metadata", "0"])
 
     if output_format in ("aac", "m4a"):
-        if has_libfdk_aac():
+        if source_matches_output(track, output_format):
+            cmd.extend(["-c:a", "copy"])
+        elif has_libfdk_aac():
             cmd.extend(["-c:a", "libfdk_aac"])
             cmd.extend(["-b:a", norm_q.lower()] if re.fullmatch(r"[0-9]+K", norm_q) else ["-vbr", "5"])
         else:
@@ -994,47 +1015,23 @@ def ffmpeg_command(track: Track, output: Path, token: str, output_format: str, q
             cmd.extend(["-c:a", "aac", "-b:a", bitrate])
         cmd.extend(["-f", "mp4"])
     elif output_format == "mp3":
-        cmd.extend(["-map", "0:v?", "-c:v", "copy", "-id3v2_version", "3", "-c:a", "libmp3lame"])
-        cmd.extend(["-b:a", norm_q.lower()] if re.fullmatch(r"[0-9]+K", norm_q) else ["-q:a", "0"])
+        cmd.extend(["-id3v2_version", "3"])
+        if source_matches_output(track, output_format):
+            cmd.extend(["-c:a", "copy"])
+        else:
+            cmd.extend(["-c:a", "libmp3lame"])
+            cmd.extend(["-b:a", norm_q.lower()] if re.fullmatch(r"[0-9]+K", norm_q) else ["-q:a", "0"])
         cmd.extend(["-f", "mp3"])
     elif output_format == "flac":
-        cmd.extend(["-c:a", "flac", "-f", "flac"])
+        cmd.extend(["-c:a", "copy" if source_matches_output(track, output_format) else "flac", "-f", "flac"])
     elif output_format in ("ogg", "opus", "vorbis"):
-        codec = "libopus" if output_format == "opus" else "libvorbis"
+        codec = "copy" if source_matches_output(track, output_format) else ("libopus" if output_format == "opus" else "libvorbis")
         cmd.extend(["-c:a", codec, "-f", "ogg"])
     else:
         cmd.extend(["-c:a", "copy"])
 
     cmd.append(str(output))
     return cmd
-
-
-def download_direct(job: DownloadJob, token: str, timeout: int = 30) -> int:
-    temp_path = job.destination.with_suffix(job.destination.suffix + ".part")
-    job.destination.parent.mkdir(parents=True, exist_ok=True)
-    unlink_quiet(temp_path)
-
-    _register_part_file(temp_path)
-    headers = {"User-Agent": f"{APP_NAME}/1.0"}
-    if token:
-        headers["X-Plex-Token"] = token
-
-    req = urllib.request.Request(job.track.media_url, headers=headers)
-    bytes_written = 0
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as response, temp_path.open("wb") as handle:
-            while chunk := response.read(64 * 1024):
-                handle.write(chunk)
-                bytes_written += len(chunk)
-
-        if bytes_written == 0:
-            unlink_quiet(temp_path)
-            raise RuntimeError("Downloaded file is empty.")
-
-        os.replace(temp_path, job.destination)
-        return bytes_written
-    finally:
-        _unregister_part_file(temp_path)
 
 
 def convert_track(job: DownloadJob, token: str, output_format: str, quality: str) -> int:
@@ -1070,18 +1067,20 @@ def download_track(
     retries: int = 3,
     retry_delay: float = 2.0,
 ) -> DownloadResult:
-    if job.destination.exists() and job.destination.stat().st_size > 0:
+    if file_is_valid(job.destination, job.track.duration_ms):
         return DownloadResult(job=job, success=True, skipped=True, bytes_written=0, elapsed=0.0, attempts=0)
 
+    unlink_quiet(job.destination)
     start_time = time.monotonic()
     last_error = ""
 
     for attempt in range(1, retries + 1):
         try:
-            if source_matches_output(job.track, output_format):
-                bytes_written = download_direct(job, token)
-            else:
-                bytes_written = convert_track(job, token, output_format, quality)
+            bytes_written = convert_track(job, token, output_format, quality)
+
+            if not file_is_valid(job.destination, job.track.duration_ms):
+                unlink_quiet(job.destination)
+                raise RuntimeError("Downloaded file failed ffprobe duration validation check.")
 
             elapsed = max(0.001, time.monotonic() - start_time)
             return DownloadResult(
@@ -1095,6 +1094,7 @@ def download_track(
         except Exception as exc:
             last_error = str(exc)
             unlink_quiet(job.destination.with_suffix(job.destination.suffix + ".part"))
+            unlink_quiet(job.destination)
             if attempt < retries:
                 time.sleep(retry_delay * attempt)
 
@@ -1120,10 +1120,7 @@ def process_download_queue(
     retry_delay: float,
     reserve_bytes: int = 0,
 ) -> tuple[list[DownloadResult], bool]:
-    """Processes download jobs with dynamic concurrency and active reserve checking.
-
-    Returns a tuple of (results, stopped_on_reserve_flag).
-    """
+    """Processes download jobs with dynamic concurrency, active reserve checking, and a live 2-line terminal dashboard."""
     if not jobs:
         return [], False
 
@@ -1133,13 +1130,63 @@ def process_download_queue(
     skipped_count = 0
     total = len(jobs)
     start_time = time.monotonic()
+    download_time_accum = 0.0
     total_bytes = 0
     stopped_on_reserve = False
 
+    active_jobs_lock = threading.Lock()
+    active_jobs: dict[int, str] = {}
+
     print(f"\nProcessing {total:,} track(s) using up to {max_workers} worker(s)...")
+    print("\n\n", end="")
 
     def _execute_job(j: DownloadJob) -> DownloadResult:
-        return download_track(j, token, output_format, quality, retries, retry_delay)
+        thread_id = threading.get_ident()
+        with active_jobs_lock:
+            active_jobs[thread_id] = j.track.title
+        try:
+            return download_track(j, token, output_format, quality, retries, retry_delay)
+        finally:
+            with active_jobs_lock:
+                active_jobs.pop(thread_id, None)
+
+    def render_dashboard(force_final: bool = False) -> None:
+        elapsed = max(0.001, time.monotonic() - start_time)
+        effective_time = max(0.001, download_time_accum / max(1, max_workers)) if download_time_accum > 0 else elapsed
+        rate = total_bytes / effective_time if total_bytes > 0 else 0.0
+
+        pct = (completed / total) * 100 if total > 0 else 0
+        bar_width = 18
+        filled = int(bar_width * completed // total) if total > 0 else 0
+        bar = "█" * filled + "░" * (bar_width - filled)
+
+        remaining_jobs = total - completed
+        avg_time_per_job = (elapsed / completed) if completed > 0 else 0
+        eta_secs = int((remaining_jobs * avg_time_per_job) / max(1, max_workers)) if completed > 0 else 0
+        eta_str = human_duration(eta_secs * 1000) if eta_secs > 0 else "--"
+
+        line1 = (
+            f"[{bar}] {pct:5.1f}% | {completed}/{total} ({skipped_count} skip) | "
+            f"{human_size(total_bytes)} | {human_rate(rate)} | ETA: {eta_str}"
+        )
+
+        with active_jobs_lock:
+            current_tracks = list(active_jobs.values())
+
+        if current_tracks:
+            visible_sample = ", ".join(f'"{compact(t, 18)}"' for t in current_tracks[:3])
+            more_cnt = len(current_tracks) - 3
+            more_str = f" (+{more_cnt} more)" if more_cnt > 0 else ""
+            line2 = f"Active ({len(current_tracks)}/{max_workers}): {visible_sample}{more_str}"
+        else:
+            line2 = f"Active (0/{max_workers}): Idle / Finishing..."
+
+        if force_final:
+            sys.stdout.write("\033[2A\033[J")
+            sys.stdout.flush()
+        else:
+            sys.stdout.write(f"\033[2A\r\033[K{line1}\n\r\033[K{line2}\n")
+            sys.stdout.flush()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         job_iter = iter(jobs)
@@ -1167,41 +1214,37 @@ def process_download_queue(
                 break
 
         while futures:
-            done, _ = concurrent.futures.wait(futures.keys(), timeout=0.2, return_when=concurrent.futures.FIRST_COMPLETED)
-            if not done:
-                continue
+            done, _ = concurrent.futures.wait(
+                futures.keys(), timeout=0.1, return_when=concurrent.futures.FIRST_COMPLETED
+            )
 
-            for fut in done:
-                res = fut.result()
-                del futures[fut]
-                results.append(res)
-                completed += 1
+            if done:
+                for fut in done:
+                    res = fut.result()
+                    del futures[fut]
+                    results.append(res)
+                    completed += 1
 
-                if res.skipped:
-                    skipped_count += 1
-                elif res.success:
-                    total_bytes += res.bytes_written
-                    adaptive.success()
-                else:
-                    adaptive.failure()
+                    if res.skipped:
+                        skipped_count += 1
+                    elif res.success:
+                        total_bytes += res.bytes_written
+                        download_time_accum += res.elapsed
+                        adaptive.success()
+                    else:
+                        adaptive.failure()
 
-                elapsed = time.monotonic() - start_time
-                rate = total_bytes / elapsed if elapsed > 0 else 0
-                skip_str = f" ({skipped_count:,} skipped)" if skipped_count > 0 else ""
-                status_line = (
-                    f" [{completed/total*100:5.1f}%] {completed}/{total}{skip_str} | "
-                    f"{human_size(total_bytes)} | {human_rate(rate)} | "
-                    f"Track: {compact(res.job.track.title, 25)}"
-                )
-                print(f"\r\033[K{status_line}", end="", flush=True)
+                    if not stopped_on_reserve:
+                        _submit_next()
 
-                if not stopped_on_reserve:
-                    _submit_next()
+            render_dashboard()
+
+    render_dashboard(force_final=True)
 
     if skipped_count == total:
-        print(f"\r\033[K  ✓ All {total:,} tracks are already up to date.")
+        print(f"  ✓ All {total:,} tracks are already up to date.")
     else:
-        print(f"\r\033[K  ✓ Processed {total:,} tracks ({human_size(total_bytes)} downloaded, {skipped_count:,} skipped).")
+        print(f"  ✓ Processed {total:,} tracks ({human_size(total_bytes)} downloaded, {skipped_count:,} skipped).")
 
     return results, stopped_on_reserve
 
