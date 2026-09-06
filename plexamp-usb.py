@@ -110,7 +110,7 @@ def handle_sigint(signum: int, frame: Any) -> None:
     term_width = shutil.get_terminal_size((80, 24)).columns
     sys.stdout.write("\r" + " " * (term_width - 1) + "\r")
     sys.stdout.flush()
-    print("Operation cancelled by user.")
+    print("\nOperation cancelled by user.")
     with TRACK_LOCK:
         for proc in list(ACTIVE_PROCESSES):
             with contextlib.suppress(OSError):
@@ -1139,14 +1139,32 @@ def process_download_queue(
     total_bytes = 0
     stopped_on_reserve = False
 
+    active_jobs_map: dict[int, str] = {}
+    active_lock = threading.Lock()
+
     term_print(f"\nProcessing {total:,} track(s) using up to {max_workers} worker(s)...")
 
     def _execute_job(j: DownloadJob) -> DownloadResult:
-        return download_track(j, token, output_format, quality, retries, retry_delay)
+        thread_id = threading.get_ident()
+        track_desc = truncate_to_width(f"{j.track.artist} - {j.track.title}", 25)
+        with active_lock:
+            active_jobs_map[thread_id] = track_desc
+        try:
+            return download_track(j, token, output_format, quality, retries, retry_delay)
+        finally:
+            with active_lock:
+                active_jobs_map.pop(thread_id, None)
 
     print_lock = threading.Lock()
     last_render_time = 0.0
-    min_render_interval = 0.04  # ~25 fps limit for buttery smooth single-line updates
+    min_render_interval = 0.04  # ~25 fps limit for smooth updates
+
+    # Allocate 2 blank lines and save cursor position at the top of the block
+    with print_lock:
+        sys.stdout.write("\n\n")
+        sys.stdout.write("\033[2A")
+        sys.stdout.write("\033[s")
+        sys.stdout.flush()
 
     def render_progress(force: bool = False) -> None:
         nonlocal last_render_time
@@ -1157,28 +1175,36 @@ def process_download_queue(
 
         elapsed = time.monotonic() - start_time
         rate = total_bytes / elapsed if elapsed > 0 else 0
-        pct = (completed / total) * 100
+        pct = (completed / total) * 100 if total > 0 else 0
 
         eta_str = "unknown"
         if rate > 0 and completed > 0:
             remaining_jobs = total - completed
-            avg_time_per_job = elapsed / completed
-            eta_secs = remaining_jobs * avg_time_per_job
+            eta_secs = remaining_jobs * (elapsed / completed)
             eta_str = human_duration(int(eta_secs * 1000))
 
-        bar_str = render_progress_bar(completed, total, width=20)
-        skip_str = f" ({skipped_count:,} skipped)" if skipped_count > 0 else ""
-        raw_line = (
-            f" {bar_str} [{pct:5.2f}%] {completed}/{total}{skip_str} | "
-            f"{human_size(total_bytes)} | {human_rate(rate)} | ETA: {eta_str}"
-        )
-
         term_width = shutil.get_terminal_size((80, 24)).columns
-        safe_width = max(10, term_width - 1)
-        line = pad_right(truncate_to_width(raw_line, safe_width), safe_width)
+        # Use term_width - 2 to strictly prevent terminal auto-wrap on the right margin
+        safe_width = max(10, term_width - 2)
+
+        bar_width = 12 if safe_width < 60 else 20
+        bar_str = render_progress_bar(completed, total, width=bar_width)
+        skip_str = f" ({skipped_count:,} skip)" if skipped_count > 0 else ""
+
+        with active_lock:
+            current_active = list(active_jobs_map.values())
+
+        line1_raw = f" {bar_str} [{pct:5.1f}%] {completed}/{total}{skip_str} | {human_size(total_bytes)} | {human_rate(rate)} | ETA: {eta_str}"
+        line1 = pad_right(truncate_to_width(line1_raw, safe_width), safe_width)
+
+        active_desc = "; ".join(current_active[:3]) if current_active else "Idle / finalizing..."
+        line2_raw = f" Active: {active_desc}"
+        line2 = pad_right(truncate_to_width(line2_raw, safe_width), safe_width)
 
         with print_lock:
-            print(f"\r\033[K{line}", end="", flush=True)
+            sys.stdout.write("\033[u")  # Restore cursor to saved top position
+            sys.stdout.write(f"\033[K{line1}\n\033[K{line2}")
+            sys.stdout.flush()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         job_iter = iter(jobs)
@@ -1192,8 +1218,7 @@ def process_download_queue(
                 return False
 
             if reserve_bytes > 0:
-                target_dir = job.destination.parent
-                if free_space(target_dir) <= reserve_bytes:
+                if free_space(job.destination.parent) <= reserve_bytes:
                     stopped_on_reserve = True
                     return False
 
@@ -1229,9 +1254,10 @@ def process_download_queue(
                 if not stopped_on_reserve:
                     _submit_next()
 
-    # Final clean render update
     render_progress(force=True)
-    print()
+    with print_lock:
+        sys.stdout.write("\n\n")  # Move cursor past the 2 status lines
+        sys.stdout.flush()
 
     if skipped_count == total:
         term_print(f"  ✓ All {total:,} tracks are already up to date.")
