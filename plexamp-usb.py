@@ -1289,14 +1289,11 @@ def process_download_queue(
                     _submit_next()
 
     render_progress(force=True)
-    with print_lock:
-        sys.stdout.write("\n")
-        sys.stdout.flush()
 
     if skipped_count == total:
-        term_print(f"  ✓ All {total:,} tracks are already up to date.")
+        term_print(f"✓ All {total:,} tracks are already up to date.")
     else:
-        term_print(f"  ✓ Processed {total:,} tracks ({human_size(total_bytes)} downloaded, {skipped_count:,} skipped).")
+        term_print(f"✓ Processed {total:,} tracks ({human_size(total_bytes)} downloaded, {skipped_count:,} skipped).")
 
     return results, stopped_on_reserve
 
