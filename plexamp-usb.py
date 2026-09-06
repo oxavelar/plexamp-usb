@@ -1010,32 +1010,51 @@ def ffmpeg_command(track: Track, output: Path, token: str, output_format: str, q
 def download_direct(job: DownloadJob, token: str, timeout: int = 30) -> int:
     temp_path = job.destination.with_suffix(job.destination.suffix + ".part")
     job.destination.parent.mkdir(parents=True, exist_ok=True)
-    unlink_quiet(temp_path)
 
     _register_part_file(temp_path)
     headers = {"User-Agent": f"{APP_NAME}/1.0"}
     if token:
         headers["X-Plex-Token"] = token
 
+    existing_size = temp_path.stat().st_size if temp_path.exists() else 0
+    if existing_size > 0:
+        headers["Range"] = f"bytes={existing_size}-"
+
     req = urllib.request.Request(job.track.media_url, headers=headers)
-    bytes_written = 0
+    bytes_written = existing_size
+
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response, temp_path.open("wb") as handle:
-            while chunk := response.read(64 * 1024):
-                handle.write(chunk)
-                bytes_written += len(chunk)
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            # If server doesn't support ranges and returns 200 OK instead of 206, reset download from scratch
+            mode = "ab"
+            if existing_size > 0 and response.status == 200:
+                existing_size = 0
+                bytes_written = 0
+                mode = "wb"
+            elif existing_size == 0:
+                mode = "wb"
+
+            with temp_path.open(mode) as handle:
+                while chunk := response.read(64 * 1024):
+                    handle.write(chunk)
+                    bytes_written += len(chunk)
 
         if bytes_written == 0:
             unlink_quiet(temp_path)
             raise RuntimeError("Downloaded file is empty.")
 
-        # Validate against Plex source size to catch truncated downloads
         if job.track.source_size > 0 and bytes_written != job.track.source_size:
             unlink_quiet(temp_path)
             raise RuntimeError(f"Download truncated: expected {job.track.source_size:,} bytes, got {bytes_written:,} bytes.")
 
         os.replace(temp_path, job.destination)
         return bytes_written
+    except urllib.error.HTTPError as exc:
+        if exc.code == 416:  # Range not satisfiable (file might already be fully downloaded)
+            if temp_path.exists() and job.track.source_size > 0 and temp_path.stat().st_size == job.track.source_size:
+                os.replace(temp_path, job.destination)
+                return temp_path.stat().st_size
+        raise
     finally:
         _unregister_part_file(temp_path)
 
@@ -1073,7 +1092,6 @@ def download_track(
     retries: int = 3,
     retry_delay: float = 2.0,
 ) -> DownloadResult:
-    # Re-download if file exists but is size-mismatched (truncated from a previous run)
     if job.destination.exists() and job.destination.stat().st_size > 0:
         if job.track.source_size <= 0 or job.destination.stat().st_size == job.track.source_size:
             return DownloadResult(job=job, success=True, skipped=True, bytes_written=0, elapsed=0.0, attempts=0)
@@ -1101,7 +1119,6 @@ def download_track(
             )
         except Exception as exc:
             last_error = str(exc)
-            unlink_quiet(job.destination.with_suffix(job.destination.suffix + ".part"))
             if attempt < retries:
                 time.sleep(retry_delay * attempt)
 
@@ -1151,7 +1168,7 @@ def process_download_queue(
     active_jobs_map: dict[int, str] = {}
     active_lock = threading.Lock()
 
-    term_print(f"\nProcessing {total:,} track(s) using up to {max_workers} worker(s)…")
+    term_print(f"\nProcessing {total:,} track(s) using up to {max_workers} worker(s)...")
 
     def _execute_job(j: DownloadJob) -> DownloadResult:
         thread_id = threading.get_ident()
@@ -1166,9 +1183,8 @@ def process_download_queue(
 
     print_lock = threading.Lock()
     last_render_time = 0.0
-    min_render_interval = 0.04  # ~25 fps limit for smooth updates
+    min_render_interval = 0.04
 
-    # Allocate 2 blank lines and save cursor position at the top of the block
     with print_lock:
         sys.stdout.write("\n\n")
         sys.stdout.write("\033[2A")
@@ -1217,7 +1233,7 @@ def process_download_queue(
             has_active = False
 
         with print_lock:
-            sys.stdout.write("\033[u")  # Restore cursor to saved top position
+            sys.stdout.write("\033[u")
             if has_active:
                 sys.stdout.write(f"\033[K{line1}\n\033[K{line2}")
             else:
@@ -1274,7 +1290,7 @@ def process_download_queue(
 
     render_progress(force=True)
     with print_lock:
-        sys.stdout.write("\n")  # Move cursor past the final rendered line
+        sys.stdout.write("\n")
         sys.stdout.flush()
 
     if skipped_count == total:
@@ -1354,7 +1370,7 @@ def main() -> None:
     )
 
     if has_random and not stopped_on_reserve:
-        term_print("\nFetching tracks for library (Random Fill)…")
+        term_print("\nFetching tracks for library (Random Fill)...")
         lib_tracks = fetch_library_tracks(server, library_key, timeout=timeout)
         playlist_track_identities = {track_identity(job.track) for job in all_jobs}
 
