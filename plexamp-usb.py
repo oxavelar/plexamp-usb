@@ -279,7 +279,7 @@ def get_disk_stats(path: Path, reserve_setting: Any = "5%") -> tuple[int, int, i
     target = resolve_existing_path(path)
     try:
         usage = shutil.disk_usage(target)
-        reserve_bytes = parse_reserve(reserve_setting, usage.total)
+        reserve_bytes = parse_reserve(reserve_setting, usage.free)
         return usage.free, usage.total, reserve_bytes
     except OSError:
         return free_space(target), 0, 0
@@ -1329,7 +1329,16 @@ def process_download_queue(
                 return False
 
             if reserve_bytes > 0:
-                if free_space(job.destination.parent) <= reserve_bytes:
+                current_free = free_space(job.destination.parent)
+                
+                # Dynamically calculate safety buffer for active in-flight thread writes
+                with TRACK_LOCK:
+                    active_buffer = len(ACTIVE_PART_FILES) * (4 * 1024 * 1024)
+                
+                expected_size = job.track.source_size if job.track.source_size > 0 else (8 * 1024 * 1024)
+                
+                # Proactive lookahead: stop before queueing if projected free space breaches reserve
+                if (current_free - active_buffer - expected_size) <= reserve_bytes:
                     stopped_on_reserve = True
                     return False
 
