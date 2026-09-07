@@ -73,6 +73,10 @@ DEFAULT_CONFIG = {
         "directory_limit": 255,
         "reserve": "5%",  # Can be "5%", "128M", "2G", "500K", or raw bytes
     },
+    "random": {
+        "max_tracks": 1000,
+        "strategy": "freshness",  # "freshness" or "pure_random"
+    },
     "download": {
         "retries": 3,
         "retry_delay": 2.0,
@@ -152,6 +156,7 @@ class Track:
     playlist_id: str
     container: str = ""
     audio_codec: str = ""
+    added_at: int = 0
 
 
 @dataclass(frozen=True)
@@ -734,6 +739,7 @@ def track_from_xml(item: ET.Element, server: PlexServer, playlist_id: str) -> Tr
         playlist_id=playlist_id,
         container=part.attrib.get("container", media.attrib.get("container", "")),
         audio_codec=part.attrib.get("audioCodec", media.attrib.get("audioCodec", "")),
+        added_at=safe_int(item.attrib.get("addedAt")),
     )
 
 
@@ -743,7 +749,7 @@ def fetch_playlist_tracks(server: PlexServer, playlist_id: str, timeout: int) ->
 
 
 def fetch_library_tracks(server: PlexServer, library_key: str, timeout: int) -> list[Track]:
-    root = plex_xml(server, f"/library/sections/{library_key}/all", params={"type": 10}, timeout=timeout)
+    root = plex_xml(server, f"/library/sections/{library_key}/all", params={"type": 10, "sort": "addedAt:desc"}, timeout=timeout)
     return [t for item in root.findall("Track") if (t := track_from_xml(item, server, "Random")) is not None]
 
 
@@ -914,6 +920,7 @@ def cleanup_playlist_leftovers(output_root: Path, playlist_name: str, tracks: li
 def cleanup_random_fill_leftovers(
     output_root: Path,
     all_library_tracks: list[Track],
+    max_random_tracks: int = 1000,
     excluded_identities: set[str] | None = None,
 ) -> None:
     random_root = output_root / "Random"
@@ -924,11 +931,24 @@ def cleanup_random_fill_leftovers(
     if excluded_identities:
         valid_keys -= excluded_identities
 
+    existing_files: list[tuple[Path, str, float]] = []
     for path in random_root.rglob("*.*"):
         if path.is_file() and path.suffix.lower() in (".mp3", ".m4a", ".aac", ".flac", ".ogg"):
             key = parse_file_identity(path)
-            if key and key not in valid_keys:
+            if not key or key not in valid_keys:
                 unlink_quiet(path)
+            else:
+                try:
+                    mtime = path.stat().st_mtime
+                except OSError:
+                    mtime = 0.0
+                existing_files.append((path, key, mtime))
+
+    if max_random_tracks > 0 and len(existing_files) > max_random_tracks:
+        existing_files.sort(key=lambda x: x[2])
+        excess = len(existing_files) - max_random_tracks
+        for path, _, _ in existing_files[:excess]:
+            unlink_quiet(path)
 
     for dirpath, _, _ in os.walk(random_root, topdown=False):
         d = Path(dirpath)
@@ -954,16 +974,29 @@ def get_existing_random_identities_and_count(output_root: Path) -> tuple[set[str
 def select_random_tracks(
     tracks: list[Track],
     output_root: Path,
+    max_random_tracks: int = 1000,
+    strategy: str = "freshness",
     excluded_identities: set[str] | None = None,
 ) -> tuple[list[Track], int]:
-    cleanup_random_fill_leftovers(output_root, tracks, excluded_identities)
+    cleanup_random_fill_leftovers(output_root, tracks, max_random_tracks=max_random_tracks, excluded_identities=excluded_identities)
 
     existing_keys, existing_count = get_existing_random_identities_and_count(output_root)
     if excluded_identities:
         existing_keys.update(excluded_identities)
 
     candidates = [t for t in tracks if track_identity(t) not in existing_keys]
-    random.SystemRandom().shuffle(candidates)
+
+    if strategy == "freshness":
+        candidates.sort(key=lambda t: t.added_at, reverse=True)
+    else:
+        random.SystemRandom().shuffle(candidates)
+
+    if max_random_tracks > 0:
+        current_total_random = existing_count - 1 + len(candidates)
+        if current_total_random > max_random_tracks:
+            allowed_new = max(0, max_random_tracks - (existing_count - 1))
+            candidates = candidates[:allowed_new]
+
     return candidates, existing_count + 1
 
 
@@ -1025,7 +1058,6 @@ def download_direct(job: DownloadJob, token: str, timeout: int = 30) -> int:
 
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
-            # If server doesn't support ranges and returns 200 OK instead of 206, reset download from scratch
             mode = "ab"
             if existing_size > 0 and response.status == 200:
                 existing_size = 0
@@ -1050,7 +1082,7 @@ def download_direct(job: DownloadJob, token: str, timeout: int = 30) -> int:
         os.replace(temp_path, job.destination)
         return bytes_written
     except urllib.error.HTTPError as exc:
-        if exc.code == 416:  # Range not satisfiable (file might already be fully downloaded)
+        if exc.code == 416:
             if temp_path.exists() and job.track.source_size > 0 and temp_path.stat().st_size == job.track.source_size:
                 os.replace(temp_path, job.destination)
                 return temp_path.stat().st_size
@@ -1092,9 +1124,6 @@ def download_track(
     retries: int = 3,
     retry_delay: float = 2.0,
 ) -> DownloadResult:
-    # Trust existing files to avoid overwriting converted tracks due to source size mismatches.
-    # (Converted files will never match the raw source size reported by Plex).
-    # Since we write to .part files and atomically rename on success, existing files are complete.
     if job.destination.exists() and job.destination.stat().st_size > 0:
         return DownloadResult(job=job, success=True, skipped=True, bytes_written=0, elapsed=0.0, attempts=0)
 
@@ -1152,6 +1181,8 @@ def process_download_queue(
     retries: int,
     retry_delay: float,
     reserve_bytes: int = 0,
+    is_random_fill: bool = False,
+    output_root: Path | None = None,
 ) -> tuple[list[DownloadResult], bool]:
     if not jobs:
         return [], False
@@ -1168,7 +1199,7 @@ def process_download_queue(
     active_jobs_map: dict[int, str] = {}
     active_lock = threading.Lock()
 
-    term_print(f"\nProcessing {total:,} track(s) using up to {max_workers} worker(s)...")
+    term_print(f"\nProcessing {total:,} track(s) using up to {max_workers} worker(s)..." if not is_random_fill else f"\nProcessing Random Fill tracks (target reserve: {human_size(reserve_bytes)}) using up to {max_workers} worker(s)...")
 
     def _execute_job(j: DownloadJob) -> DownloadResult:
         thread_id = threading.get_ident()
@@ -1183,12 +1214,10 @@ def process_download_queue(
 
     print_lock = threading.Lock()
     
-    # --- Bandwidth Tracking State ---
     last_render_time = time.monotonic()
     last_total_bytes = 0
     ewma_rate = 0.0
     min_render_interval = 0.04
-    # --------------------------------
 
     with print_lock:
         sys.stdout.write("\n\n")
@@ -1203,7 +1232,6 @@ def process_download_queue(
         if not force and dt < min_render_interval:
             return
 
-        # 1. Approximate sum of bandwidth of all active workers by measuring active .part files
         active_bytes = 0
         with TRACK_LOCK:
             active_paths = list(ACTIVE_PART_FILES)
@@ -1215,12 +1243,8 @@ def process_download_queue(
 
         current_total = total_bytes + active_bytes
 
-        # 2. Smooth the rate using Exponentially Weighted Moving Average (EWMA)
         if dt >= 0.1:
             delta = current_total - last_total_bytes
-            # If a file finishes and is removed from ACTIVE_PART_FILES before total_bytes
-            # is updated by the main thread, delta might briefly dip negative. 
-            # We ignore these transient race-condition dips to keep the reported rate stable.
             if delta >= 0:
                 inst_rate = delta / dt
                 ewma_rate = 0.2 * inst_rate + 0.8 * ewma_rate
@@ -1228,25 +1252,49 @@ def process_download_queue(
             last_render_time = now
 
         elapsed = max(0.001, time.monotonic() - start_time)
-        pct = (completed / total) * 100 if total > 0 else 0
+
+        current_free = free_space(output_root) if (is_random_fill and output_root) else 0
+        free_above_reserve = max(0, current_free - reserve_bytes) if (is_random_fill and reserve_bytes > 0) else 0
+
+        display_total = total
+        if is_random_fill and reserve_bytes > 0 and output_root:
+            avg_track_bytes = (total_bytes / completed) if completed > 0 else (
+                sum(j.track.source_size for j in jobs[:10]) / min(10, len(jobs)) if jobs else 8 * 1024 * 1024
+            )
+            if avg_track_bytes <= 0:
+                avg_track_bytes = 8 * 1024 * 1024
+            
+            estimated_remaining = int(free_above_reserve / avg_track_bytes)
+            display_total = max(completed, min(len(jobs), completed + estimated_remaining))
+
+        pct = (completed / display_total) * 100 if display_total > 0 else 0
 
         eta_str = "unknown"
-        if ewma_rate > 0 and completed > 0:
-            remaining_jobs = total - completed
-            eta_secs = remaining_jobs * (elapsed / completed)
-            eta_str = human_duration(int(eta_secs * 1000))
+        if is_random_fill and reserve_bytes > 0 and output_root:
+            if ewma_rate > 0 and free_above_reserve > 0:
+                eta_secs = free_above_reserve / ewma_rate
+                eta_str = human_duration(int(eta_secs * 1000))
+            elif ewma_rate > 0 and completed > 0:
+                remaining_jobs = display_total - completed
+                eta_secs = remaining_jobs * (elapsed / completed)
+                eta_str = human_duration(int(eta_secs * 1000))
+        else:
+            if ewma_rate > 0 and completed > 0:
+                remaining_jobs = total - completed
+                eta_secs = remaining_jobs * (elapsed / completed)
+                eta_str = human_duration(int(eta_secs * 1000))
 
         term_width = shutil.get_terminal_size((80, 24)).columns
         safe_width = max(10, term_width - 2)
 
         bar_width = 12 if safe_width < 60 else 20
-        bar_str = render_progress_bar(completed, total, width=bar_width)
+        bar_str = render_progress_bar(completed, display_total, width=bar_width)
         skip_str = f" ({skipped_count:,} skip)" if skipped_count > 0 else ""
 
         with active_lock:
             current_active = list(active_jobs_map.values())
 
-        line1_raw = f" {bar_str} {pct:5.1f}% {completed}/{total}{skip_str} | {human_size(current_total)} | {human_rate(ewma_rate)} | ETA: {eta_str}"
+        line1_raw = f" {bar_str} {pct:5.1f}% {completed}/{display_total}{skip_str} | {human_size(current_total)} | {human_rate(ewma_rate)} | ETA: {eta_str}"
         line1 = pad_right(truncate_to_width(line1_raw, safe_width), safe_width)
 
         if current_active:
@@ -1295,7 +1343,6 @@ def process_download_queue(
         while futures:
             done, _ = concurrent.futures.wait(futures.keys(), timeout=0.05, return_when=concurrent.futures.FIRST_COMPLETED)
             if not done:
-                # Force a UI update so active bandwidth draws smoothly while waiting for completions
                 render_progress() 
                 continue
 
@@ -1323,7 +1370,7 @@ def process_download_queue(
     if skipped_count == total:
         term_print(f"✓ All {total:,} tracks are already up to date.")
     else:
-        term_print(f"✓ Processed {total:,} tracks ({human_size(total_bytes)} downloaded, {skipped_count:,} skipped).")
+        term_print(f"✓ Processed {completed:,} tracks ({human_size(total_bytes)} downloaded, {skipped_count:,} skipped).")
 
     return results, stopped_on_reserve
 
@@ -1369,6 +1416,10 @@ def main() -> None:
     retries = safe_int(config["download"].get("retries"), 3)
     retry_delay = safe_float(config["download"].get("retry_delay"), 2.0)
 
+    random_config = config.get("random", {})
+    max_random_tracks = safe_int(random_config.get("max_tracks"), 1000)
+    random_strategy = str(random_config.get("strategy", "freshness"))
+
     all_jobs: list[DownloadJob] = []
     has_random = False
 
@@ -1394,6 +1445,8 @@ def main() -> None:
         retries=retries,
         retry_delay=retry_delay,
         reserve_bytes=reserve_bytes,
+        is_random_fill=False,
+        output_root=output_root,
     )
 
     if has_random and not stopped_on_reserve:
@@ -1402,7 +1455,7 @@ def main() -> None:
         playlist_track_identities = {track_identity(job.track) for job in all_jobs}
 
         random_candidates, start_position = select_random_tracks(
-            lib_tracks, output_root, excluded_identities=playlist_track_identities
+            lib_tracks, output_root, max_random_tracks=max_random_tracks, strategy=random_strategy, excluded_identities=playlist_track_identities
         )
         random_root = output_root / "Random"
         random_root.mkdir(parents=True, exist_ok=True)
@@ -1424,6 +1477,8 @@ def main() -> None:
                 retries=retries,
                 retry_delay=retry_delay,
                 reserve_bytes=reserve_bytes,
+                is_random_fill=True,
+                output_root=output_root,
             )
             results.extend(rand_results)
             if rand_stopped_reserve:
