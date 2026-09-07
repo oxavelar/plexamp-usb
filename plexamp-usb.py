@@ -1199,7 +1199,7 @@ def process_download_queue(
     active_jobs_map: dict[int, str] = {}
     active_lock = threading.Lock()
 
-    term_print(f"\nProcessing {total:,} track(s) using up to {max_workers} worker(s)..." if not is_random_fill else f"\nProcessing Random Fill tracks (target reserve: {human_size(reserve_bytes)}) using up to {max_workers} worker(s)...")
+    term_print(f"\nProcessing {total:,} track(s) using up to {max_workers} worker(s)…" if not is_random_fill else f"\nProcessing Random Fill tracks (target reserve: {human_size(reserve_bytes)}) using up to {max_workers} worker(s)…")
 
     def _execute_job(j: DownloadJob) -> DownloadResult:
         thread_id = threading.get_ident()
@@ -1450,7 +1450,7 @@ def main() -> None:
     )
 
     if has_random and not stopped_on_reserve:
-        term_print("\nFetching tracks for library (Random Fill)...")
+        term_print("\nFetching tracks for library (Random Fill)…")
         lib_tracks = fetch_library_tracks(server, library_key, timeout=timeout)
         playlist_track_identities = {track_identity(job.track) for job in all_jobs}
 
