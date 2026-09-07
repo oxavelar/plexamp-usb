@@ -1258,7 +1258,8 @@ def process_download_queue(
 
         display_total = total
         if is_random_fill and reserve_bytes > 0 and output_root:
-            avg_track_bytes = (total_bytes / completed) if completed > 0 else (
+            downloaded_count = completed - skipped_count
+            avg_track_bytes = (total_bytes / downloaded_count) if downloaded_count > 0 else (
                 sum(j.track.source_size for j in jobs[:10]) / min(10, len(jobs)) if jobs else 8 * 1024 * 1024
             )
             if avg_track_bytes <= 0:
@@ -1302,7 +1303,7 @@ def process_download_queue(
                 active_desc = "; ".join(current_active[:3]) + "…"
             else:
                 active_desc = "; ".join(current_active)
-            line2_raw = f" Active: {active_desc}"
+            line2_raw = f"Active: {active_desc}"
             line2 = pad_right(truncate_to_width(line2_raw, safe_width), safe_width)
             has_active = True
         else:
