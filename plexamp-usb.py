@@ -1092,11 +1092,11 @@ def download_track(
     retries: int = 3,
     retry_delay: float = 2.0,
 ) -> DownloadResult:
+    # Trust existing files to avoid overwriting converted tracks due to source size mismatches.
+    # (Converted files will never match the raw source size reported by Plex).
+    # Since we write to .part files and atomically rename on success, existing files are complete.
     if job.destination.exists() and job.destination.stat().st_size > 0:
-        if job.track.source_size <= 0 or job.destination.stat().st_size == job.track.source_size:
-            return DownloadResult(job=job, success=True, skipped=True, bytes_written=0, elapsed=0.0, attempts=0)
-        else:
-            unlink_quiet(job.destination)
+        return DownloadResult(job=job, success=True, skipped=True, bytes_written=0, elapsed=0.0, attempts=0)
 
     start_time = time.monotonic()
     last_error = ""
@@ -1182,8 +1182,13 @@ def process_download_queue(
                 active_jobs_map.pop(thread_id, None)
 
     print_lock = threading.Lock()
-    last_render_time = 0.0
+    
+    # --- Bandwidth Tracking State ---
+    last_render_time = time.monotonic()
+    last_total_bytes = 0
+    ewma_rate = 0.0
     min_render_interval = 0.04
+    # --------------------------------
 
     with print_lock:
         sys.stdout.write("\n\n")
@@ -1192,18 +1197,41 @@ def process_download_queue(
         sys.stdout.flush()
 
     def render_progress(force: bool = False) -> None:
-        nonlocal last_render_time
+        nonlocal last_render_time, last_total_bytes, ewma_rate
         now = time.monotonic()
-        if not force and (now - last_render_time) < min_render_interval:
+        dt = now - last_render_time
+        if not force and dt < min_render_interval:
             return
-        last_render_time = now
 
-        elapsed = time.monotonic() - start_time
-        rate = total_bytes / elapsed if elapsed > 0 else 0
+        # 1. Approximate sum of bandwidth of all active workers by measuring active .part files
+        active_bytes = 0
+        with TRACK_LOCK:
+            active_paths = list(ACTIVE_PART_FILES)
+        for p in active_paths:
+            try:
+                active_bytes += p.stat().st_size
+            except OSError:
+                pass
+
+        current_total = total_bytes + active_bytes
+
+        # 2. Smooth the rate using Exponentially Weighted Moving Average (EWMA)
+        if dt >= 0.1:
+            delta = current_total - last_total_bytes
+            # If a file finishes and is removed from ACTIVE_PART_FILES before total_bytes
+            # is updated by the main thread, delta might briefly dip negative. 
+            # We ignore these transient race-condition dips to keep the reported rate stable.
+            if delta >= 0:
+                inst_rate = delta / dt
+                ewma_rate = 0.2 * inst_rate + 0.8 * ewma_rate
+                last_total_bytes = current_total
+            last_render_time = now
+
+        elapsed = max(0.001, time.monotonic() - start_time)
         pct = (completed / total) * 100 if total > 0 else 0
 
         eta_str = "unknown"
-        if rate > 0 and completed > 0:
+        if ewma_rate > 0 and completed > 0:
             remaining_jobs = total - completed
             eta_secs = remaining_jobs * (elapsed / completed)
             eta_str = human_duration(int(eta_secs * 1000))
@@ -1218,7 +1246,7 @@ def process_download_queue(
         with active_lock:
             current_active = list(active_jobs_map.values())
 
-        line1_raw = f" {bar_str} {pct:5.1f}% {completed}/{total}{skip_str} | {human_size(total_bytes)} | {human_rate(rate)} | ETA: {eta_str}"
+        line1_raw = f" {bar_str} {pct:5.1f}% {completed}/{total}{skip_str} | {human_size(current_total)} | {human_rate(ewma_rate)} | ETA: {eta_str}"
         line1 = pad_right(truncate_to_width(line1_raw, safe_width), safe_width)
 
         if current_active:
@@ -1267,6 +1295,8 @@ def process_download_queue(
         while futures:
             done, _ = concurrent.futures.wait(futures.keys(), timeout=0.05, return_when=concurrent.futures.FIRST_COMPLETED)
             if not done:
+                # Force a UI update so active bandwidth draws smoothly while waiting for completions
+                render_progress() 
                 continue
 
             for fut in done:
