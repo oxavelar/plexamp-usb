@@ -75,7 +75,7 @@ DEFAULT_CONFIG = {
     },
     "random": {
         "max_tracks": 1000,
-        "strategy": "freshness",  # "freshness" or "pure_random"
+        "strategy": "freshness",  # "freshness" or "random"
     },
     "download": {
         "retries": 3,
@@ -1058,13 +1058,15 @@ def download_direct(job: DownloadJob, token: str, timeout: int = 30) -> int:
 
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
+            status_code = getattr(response, "status", getattr(response, "code", 200))
             mode = "ab"
-            if existing_size > 0 and response.status == 200:
+            if existing_size > 0 and status_code == 200:
                 existing_size = 0
                 bytes_written = 0
                 mode = "wb"
-            elif existing_size == 0:
+            elif existing_size == 0 or status_code != 206:
                 mode = "wb"
+                bytes_written = 0
 
             with temp_path.open(mode) as handle:
                 while chunk := response.read(64 * 1024):
@@ -1124,15 +1126,25 @@ def download_track(
     retries: int = 3,
     retry_delay: float = 2.0,
 ) -> DownloadResult:
-    if job.destination.exists() and job.destination.stat().st_size > 0:
-        return DownloadResult(job=job, success=True, skipped=True, bytes_written=0, elapsed=0.0, attempts=0)
+    is_direct = source_matches_output(job.track, output_format)
+
+    if job.destination.exists():
+        dest_size = job.destination.stat().st_size
+        if is_direct and job.track.source_size > 0:
+            if dest_size == job.track.source_size:
+                return DownloadResult(job=job, success=True, skipped=True, bytes_written=0, elapsed=0.0, attempts=0)
+            else:
+                # Truncated or mismatched file from previous interrupted run; discard and re-download
+                unlink_quiet(job.destination)
+        elif dest_size > 0:
+            return DownloadResult(job=job, success=True, skipped=True, bytes_written=0, elapsed=0.0, attempts=0)
 
     start_time = time.monotonic()
     last_error = ""
 
     for attempt in range(1, retries + 1):
         try:
-            if source_matches_output(job.track, output_format):
+            if is_direct:
                 bytes_written = download_direct(job, token)
             else:
                 bytes_written = convert_track(job, token, output_format, quality)
@@ -1331,13 +1343,11 @@ def process_download_queue(
             if reserve_bytes > 0:
                 current_free = free_space(job.destination.parent)
                 
-                # Dynamically calculate safety buffer for active in-flight thread writes
                 with TRACK_LOCK:
                     active_buffer = len(ACTIVE_PART_FILES) * (4 * 1024 * 1024)
                 
                 expected_size = job.track.source_size if job.track.source_size > 0 else (8 * 1024 * 1024)
                 
-                # Proactive lookahead: stop before queueing if projected free space breaches reserve
                 if (current_free - active_buffer - expected_size) <= reserve_bytes:
                     stopped_on_reserve = True
                     return False
