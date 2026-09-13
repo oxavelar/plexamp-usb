@@ -28,6 +28,7 @@ import contextlib
 import functools
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -176,8 +177,9 @@ def handle_sigint(signum: int, frame: Any) -> None:
         for proc in list(ACTIVE_PROCESSES):
             with contextlib.suppress(OSError):
                 proc.kill()
-        for path in list(PART_PROGRESS):
-            unlink_quiet(path)
+        for path, written in list(PART_PROGRESS.items()):
+            if written < 0:
+                unlink_quiet(path)
     os._exit(130)
 
 
@@ -982,9 +984,6 @@ def parse_file_identity(path: Path) -> str | None:
 
 def verify_track_duration(temp_path: Path, track: Track) -> None:
     """Verify audio stream integrity and duration post-download or conversion using ffprobe."""
-    if track.duration_ms <= 0:
-        return
-
     expected_seconds = track.duration_ms / 1000.0
     try:
         probe = subprocess.run(
@@ -999,11 +998,21 @@ def verify_track_duration(temp_path: Path, track: Track) -> None:
             text=True,
             check=False,
         )
-        actual_seconds = float(probe.stdout.strip()) if probe.returncode == 0 else 0.0
-    except (OSError, ValueError):
-        return  # An unreadable probe is not evidence of truncation; accept the file.
+    except OSError as exc:
+        raise RuntimeError("Unable to run ffprobe to validate the downloaded file.") from exc
 
-    if actual_seconds and actual_seconds < (expected_seconds - DURATION_TOLERANCE_SECONDS):
+    if probe.returncode != 0:
+        raise RuntimeError(f"Media validation failed: ffprobe exited with code {probe.returncode}.")
+
+    try:
+        actual_seconds = float(probe.stdout.strip())
+    except ValueError as exc:
+        raise RuntimeError("Media validation failed: ffprobe returned no valid duration.") from exc
+
+    if not math.isfinite(actual_seconds) or actual_seconds <= 0:
+        raise RuntimeError("Media validation failed: duration must be finite and positive.")
+
+    if track.duration_ms > 0 and actual_seconds < (expected_seconds - DURATION_TOLERANCE_SECONDS):
         raise RuntimeError(f"File truncated: expected ~{expected_seconds:.1f}s, got {actual_seconds:.1f}s.")
 
 
@@ -1108,10 +1117,7 @@ def select_random_tracks(
         random.SystemRandom().shuffle(candidates)
 
     if max_random_tracks > 0:
-        current_total_random = existing_count - 1 + len(candidates)
-        if current_total_random > max_random_tracks:
-            allowed_new = max(0, max_random_tracks - (existing_count - 1))
-            candidates = candidates[:allowed_new]
+        candidates = candidates[:max(0, max_random_tracks - existing_count)]
 
     return candidates, existing_count + 1
 
@@ -1182,7 +1188,8 @@ def _finalize_part(job: DownloadJob, temp_path: Path, written: int, expected: in
         raise RuntimeError("Downloaded file is empty.")
 
     if expected > 0 and written != expected:
-        unlink_quiet(temp_path)
+        if written > expected:
+            unlink_quiet(temp_path)
         raise RuntimeError(f"Download truncated: expected {expected:,} bytes, got {written:,} bytes.")
 
     try:
@@ -1263,29 +1270,11 @@ def convert_track(job: DownloadJob, token: str, output_format: str, quality: str
         _unregister_part_file(temp_path)
 
 
-def _reuse_existing(job: DownloadJob, is_direct: bool) -> bool:
-    """Report whether the destination already holds a usable file, deleting it if not."""
-    if not job.destination.exists():
-        return False
-
-    # Only a short file proves an interrupted run; Plex's recorded size can lag the real one.
-    if is_direct and job.track.source_size > 0:
-        if job.destination.stat().st_size >= job.track.source_size:
-            return True
-        unlink_quiet(job.destination)
-        return False
-
-    return job.destination.stat().st_size > 0
-
-
 def download_track(job: DownloadJob, token: str, options: ExportOptions) -> DownloadResult:
-    # Direct-copy when the source is already in a configured format; this must
-    # mirror build_output_path's format choice so the .part/resume path is used
-    # for every supported format, not only the top-priority one.
-    is_direct = is_format_supported(job.track, options.conversion_formats)
-
-    if _reuse_existing(job, is_direct):
+    if job.destination.exists():
         return DownloadResult(job=job, success=True, skipped=True, bytes_written=0, elapsed=0.0, attempts=0)
+
+    is_direct = is_format_supported(job.track, options.conversion_formats)
 
     start_time = time.monotonic()
     last_error = ""
@@ -1356,18 +1345,16 @@ def process_download_queue(
 
     term_print(f"\nProcessing {total:,} track(s) using up to {max_workers} worker(s)…" if not is_random_fill else f"\nProcessing Random Fill tracks (target reserve: {human_size(reserve_bytes)}) using up to {max_workers} worker(s)…")
 
-    def _execute_job(j: DownloadJob) -> DownloadResult:
+    def _execute_job(job: DownloadJob) -> DownloadResult:
         thread_id = threading.get_ident()
-        track_desc = truncate_to_width(f"{j.track.artist} - {j.track.title}", 25)
+        track_desc = truncate_to_width(f"{job.track.artist} - {job.track.title}", 25)
         with active_lock:
             active_jobs_map[thread_id] = track_desc
         try:
-            return download_track(j, token, options)
+            return download_track(job, token, options)
         finally:
             with active_lock:
                 active_jobs_map.pop(thread_id, None)
-
-    print_lock = threading.Lock()
 
     last_render_time = time.monotonic()
     last_scan_time = 0.0
@@ -1379,19 +1366,17 @@ def process_download_queue(
     scan_interval = 0.1
     projecting = is_random_fill and reserve_bytes > 0
 
-    with print_lock:
-        sys.stdout.write("\n\n")
-        sys.stdout.write("\033[2A")
-        sys.stdout.write("\033[s")
-        sys.stdout.flush()
+    sys.stdout.write("\n\n\033[2A\033[s")
+    sys.stdout.flush()
+
+    sample = jobs[:10]
+    fallback_track_bytes = sum(job.track.source_size for job in sample) / len(sample) or 8 * 1024 * 1024
 
     def _average_track_bytes() -> float:
         downloaded_count = completed - skipped_count
         if downloaded_count > 0 and total_bytes > 0:
             return total_bytes / downloaded_count
-        sample = jobs[:10]
-        estimate = sum(j.track.source_size for j in sample) / len(sample) if sample else 0
-        return estimate or 8 * 1024 * 1024
+        return fallback_track_bytes
 
     def _format_eta(seconds: float) -> str:
         return human_duration(int(seconds * 1000))
@@ -1452,10 +1437,8 @@ def process_download_queue(
             active_desc = "; ".join(current_active[:3]) + ("…" if len(current_active) > 3 else "")
             line2 = pad_right(truncate_to_width(f"Active: {active_desc}", safe_width), safe_width)
 
-        with print_lock:
-            sys.stdout.write("\033[u")
-            sys.stdout.write(f"\033[K{line1}\n\033[K{line2}")
-            sys.stdout.flush()
+        sys.stdout.write(f"\033[u\033[K{line1}\n\033[K{line2}")
+        sys.stdout.flush()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         job_iter = iter(jobs)
@@ -1468,7 +1451,7 @@ def process_download_queue(
             except StopIteration:
                 return False
 
-            if reserve_bytes > 0:
+            if reserve_bytes > 0 and not job.destination.exists():
                 # In-flight parts have not landed on disk yet; hold back a slot for each.
                 active_buffer = active_part_count() * (4 * 1024 * 1024)
                 expected_size = job.track.source_size or (8 * 1024 * 1024)
