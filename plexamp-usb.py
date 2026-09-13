@@ -1157,6 +1157,24 @@ def ffmpeg_command(track: Track, output: Path, token: str, output_format: str, q
     return cmd
 
 
+def download_url(media_url: str) -> str:
+    """Plex only serves the untouched original when asked to download; otherwise it may remux."""
+    return f"{media_url}{'&' if '?' in media_url else '?'}download=1"
+
+
+def expected_response_bytes(response: Any, resuming: bool, existing_size: int) -> int:
+    """Total file size the server committed to, which outranks Plex's cached metadata size."""
+    content_range = response.headers.get("Content-Range", "")
+    if "/" in content_range:
+        if (total := safe_int(content_range.rsplit("/", 1)[1])) > 0:
+            return total
+
+    length = safe_int(response.headers.get("Content-Length"))
+    if length <= 0:
+        return 0
+    return length + existing_size if resuming else length
+
+
 def _finalize_part(job: DownloadJob, temp_path: Path, written: int, expected: int = 0) -> int:
     """Validate a finished .part file and atomically promote it to its destination."""
     if written == 0:
@@ -1195,12 +1213,13 @@ def download_direct(job: DownloadJob, token: str, timeout: int = 30) -> int:
 
     _register_part_file(temp_path, existing_size)
     try:
-        request = urllib.request.Request(job.track.media_url, headers=headers)
+        request = urllib.request.Request(download_url(job.track.media_url), headers=headers)
         with urllib.request.urlopen(request, timeout=timeout) as response:
             status_code = getattr(response, "status", None) or getattr(response, "code", 200)
             # Anything other than a 206 means the server restarted the stream from zero.
             resuming = existing_size > 0 and status_code == 206
             bytes_written = existing_size if resuming else 0
+            expected_total = expected_response_bytes(response, resuming, existing_size)
 
             with temp_path.open("ab" if resuming else "wb") as handle:
                 while chunk := response.read(DOWNLOAD_CHUNK_BYTES):
@@ -1208,12 +1227,14 @@ def download_direct(job: DownloadJob, token: str, timeout: int = 30) -> int:
                     bytes_written += len(chunk)
                     _update_part_progress(temp_path, bytes_written)
 
-        return _finalize_part(job, temp_path, bytes_written, expected=source_size)
+        return _finalize_part(job, temp_path, bytes_written, expected=expected_total)
     except urllib.error.HTTPError as exc:
         # 416 means the range started at or past EOF: the part already holds the whole file.
         if exc.code == 416 and source_size > 0 and temp_path.exists() and temp_path.stat().st_size == source_size:
             return _finalize_part(job, temp_path, source_size, expected=source_size)
-        raise
+        raise RuntimeError(f"HTTP {exc.code} {exc.reason} for {job.destination.name}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Network error: {exc.reason}") from exc
     finally:
         _unregister_part_file(temp_path)
 
@@ -1247,9 +1268,9 @@ def _reuse_existing(job: DownloadJob, is_direct: bool) -> bool:
     if not job.destination.exists():
         return False
 
-    # Only direct copies have a known exact size to validate an interrupted run against.
+    # Only a short file proves an interrupted run; Plex's recorded size can lag the real one.
     if is_direct and job.track.source_size > 0:
-        if job.destination.stat().st_size == job.track.source_size:
+        if job.destination.stat().st_size >= job.track.source_size:
             return True
         unlink_quiet(job.destination)
         return False
@@ -1493,6 +1514,15 @@ def process_download_queue(
         term_print(f"✓ All {total:,} tracks are already up to date.")
     else:
         term_print(f"✓ Processed {completed:,} tracks ({human_size(total_bytes)} downloaded, {skipped_count:,} skipped).")
+
+    failures = [r for r in results if not r.success]
+    if failures:
+        term_print(f"✗ {len(failures):,} track(s) failed:")
+        for res in failures[:10]:
+            label = truncate_to_width(f"{res.job.track.artist} - {res.job.track.title}", 40)
+            term_print(f"    {label}: {res.error or 'unknown error'}")
+        if len(failures) > 10:
+            term_print(f"    … and {len(failures) - 10:,} more.")
 
     return results, stopped_on_reserve
 
