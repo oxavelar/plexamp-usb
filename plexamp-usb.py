@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import functools
 import hashlib
 import json
 import os
@@ -41,13 +42,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Iterable
 import unicodedata
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Any, Iterator
 
 
 APP_NAME = "plexamp-usb"
+USER_AGENT = f"{APP_NAME}/1.0"
 CONFIG_JSON = "settings.json"
 CONFIG_PATH = Path(__file__).resolve().parent / CONFIG_JSON
 DOWNLOAD_DIR = "Downloads"
@@ -55,6 +57,31 @@ DOWNLOAD_DIR = "Downloads"
 DURATION_TOLERANCE_SECONDS = 2.0
 ADAPTIVE_SUCCESS_THRESHOLD = 8
 ADAPTIVE_MIN_WORKERS = 1
+DOWNLOAD_CHUNK_BYTES = 64 * 1024
+PART_SUFFIX = ".part"
+AUDIO_EXTENSIONS = frozenset({".mp3", ".m4a", ".aac", ".flac", ".ogg"})
+
+# Every container/codec/extension spelling Plex reports, mapped to one canonical format.
+FORMAT_ALIASES = {
+    "mp3": "mp3", "mpeg": "mp3",
+    "aac": "aac", "m4a": "aac", "mp4": "aac", "mp4a": "aac",
+    "flac": "flac",
+    "ogg": "ogg", "oga": "ogg", "vorbis": "ogg", "opus": "ogg",
+}
+KNOWN_FORMATS = frozenset(FORMAT_ALIASES.values())
+FORMAT_EXTENSIONS = {"aac": ".m4a", "mp3": ".mp3", "flac": ".flac", "ogg": ".ogg"}
+
+RESERVED_NAMES = (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+ILLEGAL_CHARS_PATTERN = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
+WHITESPACE_PATTERN = re.compile(r"\s+")
+BITRATE_PATTERN = re.compile(r"[0-9]+K")
+FORMAT_NAME_PATTERN = re.compile(r"[a-z0-9._+-]+")
+SIZE_UNITS = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+RESERVE_PATTERN = re.compile(r"^([0-9]*\.?[0-9]+)\s*(%|[KMGT]B?|B)?$", re.IGNORECASE)
 
 DEFAULT_CONFIG = {
     "plex": {
@@ -83,43 +110,73 @@ DEFAULT_CONFIG = {
     },
 }
 
-_HAS_FDK_AAC: bool | None = None
-
 ACTIVE_PROCESSES: set[subprocess.Popen] = set()
-ACTIVE_PART_FILES: set[Path] = set()
-TRACK_LOCK = threading.Lock()
+# In-flight .part files -> bytes written, or -1 when only the filesystem knows (ffmpeg).
+PART_PROGRESS: dict[Path, int] = {}
+# Reentrant so a Ctrl-C arriving while the main thread already holds it cannot deadlock.
+STATE_LOCK = threading.RLock()
 
 
-def _register_part_file(path: Path) -> None:
-    with TRACK_LOCK:
-        ACTIVE_PART_FILES.add(path)
+def part_path(destination: Path) -> Path:
+    return destination.with_suffix(destination.suffix + PART_SUFFIX)
+
+
+def _register_part_file(path: Path, written: int = -1) -> None:
+    with STATE_LOCK:
+        PART_PROGRESS[path] = written
+
+
+def _update_part_progress(path: Path, written: int) -> None:
+    # Only the owning worker touches its own key, and dict stores are atomic, so no lock.
+    PART_PROGRESS[path] = written
 
 
 def _unregister_part_file(path: Path) -> None:
-    with TRACK_LOCK:
-        ACTIVE_PART_FILES.discard(path)
+    with STATE_LOCK:
+        PART_PROGRESS.pop(path, None)
+
+
+def active_part_bytes() -> int:
+    """Bytes buffered in in-flight .part files, polling only the ones that cannot self-report."""
+    with STATE_LOCK:
+        snapshot = list(PART_PROGRESS.items())
+
+    total = 0
+    for path, written in snapshot:
+        if written >= 0:
+            total += written
+            continue
+        try:
+            total += path.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def active_part_count() -> int:
+    with STATE_LOCK:
+        return len(PART_PROGRESS)
 
 
 def _register_process(proc: subprocess.Popen) -> None:
-    with TRACK_LOCK:
+    with STATE_LOCK:
         ACTIVE_PROCESSES.add(proc)
 
 
 def _unregister_process(proc: subprocess.Popen) -> None:
-    with TRACK_LOCK:
+    with STATE_LOCK:
         ACTIVE_PROCESSES.discard(proc)
 
 
 def handle_sigint(signum: int, frame: Any) -> None:
-    term_width = shutil.get_terminal_size((80, 24)).columns
-    sys.stdout.write("\r" + " " * (term_width - 1) + "\r")
+    sys.stdout.write("\r\033[K")
     sys.stdout.flush()
     print("\nOperation cancelled by user.")
-    with TRACK_LOCK:
+    with STATE_LOCK:
         for proc in list(ACTIVE_PROCESSES):
             with contextlib.suppress(OSError):
                 proc.kill()
-        for path in list(ACTIVE_PART_FILES):
+        for path in list(PART_PROGRESS):
             unlink_quiet(path)
     os._exit(130)
 
@@ -178,17 +235,53 @@ class DownloadResult:
     error: str = ""
 
 
+@dataclass(frozen=True)
+class ExportOptions:
+    """Fully resolved settings shared by every stage of an export run."""
+
+    output_root: Path
+    directory_limit: int
+    conversion_formats: list[str]
+    output_format: str
+    quality: str
+    max_workers: int
+    retries: int
+    retry_delay: float
+    reserve_setting: Any
+    reserve_bytes: int
+
+    @classmethod
+    def from_config(cls, config: dict) -> ExportOptions:
+        output_root = Path(config["output"].get("directory", DOWNLOAD_DIR)).resolve()
+        reserve_setting = config["output"].get("reserve", "5%")
+        output_format, quality = conversion_spec(config)
+        _, _, reserve_bytes = get_disk_stats(output_root, reserve_setting)
+        return cls(
+            output_root=output_root,
+            directory_limit=safe_int(config["output"].get("directory_limit"), 255),
+            conversion_formats=config["audio"].get("conversion_formats", ["aac:vbr"]),
+            output_format=output_format,
+            quality=quality,
+            max_workers=conversion_threads(config),
+            retries=safe_int(config["download"].get("retries"), 3),
+            retry_delay=safe_float(config["download"].get("retry_delay"), 2.0),
+            reserve_setting=reserve_setting,
+            reserve_bytes=reserve_bytes,
+        )
+
+
 class AdaptiveConcurrency:
-    """Dynamically adjust worker concurrency based on throughput performance."""
+    """Halve the in-flight job count after failures, restoring it after a run of successes."""
 
     def __init__(self, maximum: int) -> None:
-        self.maximum = max(ADAPTIVE_MIN_WORKERS, int(maximum))
+        self.stages = self._build_stages(max(ADAPTIVE_MIN_WORKERS, int(maximum)))
         self.stage = 0
         self.consecutive_successes = 0
 
-    def _stages(self) -> list[int]:
+    @staticmethod
+    def _build_stages(maximum: int) -> list[int]:
         stages: list[int] = []
-        value = self.maximum
+        value = maximum
         while value > 1:
             stages.append(value)
             value = max(1, value // 2)
@@ -198,14 +291,11 @@ class AdaptiveConcurrency:
 
     @property
     def workers(self) -> int:
-        stages = self._stages()
-        self.stage = min(self.stage, len(stages) - 1)
-        return stages[self.stage]
+        return self.stages[self.stage]
 
     def failure(self) -> bool:
         self.consecutive_successes = 0
-        stages = self._stages()
-        if self.stage >= len(stages) - 1:
+        if self.stage >= len(self.stages) - 1:
             return False
         self.stage += 1
         return True
@@ -243,19 +333,14 @@ def parse_reserve(reserve_setting: Any, total_bytes: int) -> int:
     if isinstance(reserve_setting, (int, float)):
         return int(reserve_setting)
 
-    res = str(reserve_setting or "5%").strip().upper().replace(" ", "")
+    match = RESERVE_PATTERN.match(str(reserve_setting or "5%").strip())
+    if match is None:
+        return safe_int(reserve_setting)
 
-    if res.endswith("%"):
-        pct = safe_float(res[:-1], 5.0)
-        return int(total_bytes * (pct / 100.0))
-
-    units = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
-    for unit, multiplier in units.items():
-        if res.endswith(unit) or res.endswith(unit + "B"):
-            number_part = res.rstrip("B").rstrip(unit)
-            return int(safe_float(number_part) * multiplier)
-
-    return safe_int(res)
+    number, unit = safe_float(match.group(1)), (match.group(2) or "").upper()
+    if unit == "%":
+        return int(total_bytes * number / 100.0)
+    return int(number * SIZE_UNITS.get(unit[:1], 1))
 
 
 def resolve_existing_path(path: Path) -> Path:
@@ -285,41 +370,59 @@ def get_disk_stats(path: Path, reserve_setting: Any = "5%") -> tuple[int, int, i
         return free_space(target), 0, 0
 
 
+@functools.lru_cache(maxsize=4096)
+def char_width(char: str) -> int:
+    """Display columns for one character; variation selectors and ZWJ occupy none."""
+    code = ord(char)
+    if (0xFE00 <= code <= 0xFE0F) or (0xE0100 <= code <= 0xE01EF) or code == 0x200D:
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+
+
 def display_width(text: str) -> int:
     """Calculate terminal display column width using standard East Asian Width rules."""
-    width = 0
-    for char in str(text):
-        code = ord(char)
-        if (0xFE00 <= code <= 0xFE0F) or (0xE0100 <= code <= 0xE01EF) or code == 0x200D:
-            continue
-        width += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
-    return width
+    text = str(text)
+    return len(text) if text.isascii() else sum(char_width(c) for c in text)
 
 
 def truncate_to_width(text: str, max_width: int) -> str:
     """Truncate text strictly by display column width to prevent auto-wrapping."""
-    current_w = 0
-    result = []
-    for char in str(text):
-        code = ord(char)
-        char_w = 0 if ((0xFE00 <= code <= 0xFE0F) or (0xE0100 <= code <= 0xE01EF) or code == 0x200D) else (2 if unicodedata.east_asian_width(char) in ("W", "F") else 1)
-        if current_w + char_w > max_width:
-            break
-        result.append(char)
-        current_w += char_w
-    return "".join(result)
+    text = str(text)
+    if max_width <= 0:
+        return ""
+    if text.isascii():
+        return text[:max_width]
+
+    used = 0
+    for position, char in enumerate(text):
+        used += char_width(char)
+        if used > max_width:
+            return text[:position]
+    return text
 
 
 def pad_right(text: str, total_width: int) -> str:
-    text_str = str(text)
-    w = display_width(text_str)
-    return text_str + " " * max(0, total_width - w)
+    text = str(text)
+    return text + " " * max(0, total_width - display_width(text))
+
+
+_TERM_WIDTH_CACHE: tuple[float, int] = (0.0, 80)
+
+
+def terminal_width(ttl: float = 0.5) -> int:
+    """Terminal width behind a short TTL cache; the underlying query is too costly per frame."""
+    global _TERM_WIDTH_CACHE
+    now = time.monotonic()
+    stamp, width = _TERM_WIDTH_CACHE
+    if now - stamp >= ttl:
+        width = shutil.get_terminal_size((80, 24)).columns
+        _TERM_WIDTH_CACHE = (now, width)
+    return width
 
 
 def term_print(text: str = "", *, end: str = "\n", flush: bool = True) -> None:
     """Print line with absolute line clearing and padding to eliminate ghosting artifacts."""
-    term_width = shutil.get_terminal_size((80, 24)).columns
-    padded = pad_right(str(text), term_width - 1)
+    padded = pad_right(str(text), terminal_width() - 1)
     print(f"\r\033[K{padded}{end}", end="", flush=flush)
 
 
@@ -351,32 +454,39 @@ def human_duration(milliseconds: Any) -> str:
     return f"{minutes}m {secs}s" if minutes else f"{secs}s"
 
 
+@functools.lru_cache(maxsize=8192)
 def sanitize_filename(value: str, fallback: str = "Unknown", max_bytes: int = 255) -> str:
     value = unicodedata.normalize("NFC", str(value or "")).replace("\x00", "")
-    value = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]', "_", value)
-    value = re.sub(r"\s+", " ", value).strip().rstrip(". ") or fallback
+    value = ILLEGAL_CHARS_PATTERN.sub("_", value)
+    value = WHITESPACE_PATTERN.sub(" ", value).strip().rstrip(". ") or fallback
 
-    reserved = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
-    if value.upper() in reserved:
+    if value.upper() in RESERVED_NAMES:
         value = f"_{value}"
 
-    if len(value.encode("utf-8")) <= max_bytes:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
         return value
 
     suffix = f"…{stable_hash(value, 6)}"
-    while value and len((value + suffix).encode("utf-8")) > max_bytes:
-        value = value[:-1]
-
-    return value + suffix if value else suffix.encode("utf-8")[:max_bytes].decode("utf-8", "ignore")
+    budget = max_bytes - len(suffix.encode("utf-8"))
+    if budget <= 0:
+        return suffix.encode("utf-8")[:max_bytes].decode("utf-8", "ignore")
+    return encoded[:budget].decode("utf-8", "ignore") + suffix
 
 
 def stable_hash(value: str, length: int = 8) -> str:
-    return hashlib.sha1(value.encode("utf-8")).hexdigest()[:length]
+    return hashlib.sha1(value.encode("utf-8"), usedforsecurity=False).hexdigest()[:length]
+
+
+def canonical_format(value: str) -> str:
+    """Collapse a container, codec, or extension spelling onto one canonical format name."""
+    value = str(value or "").casefold().lstrip(".")
+    return FORMAT_ALIASES.get(value, value)
 
 
 def format_extension(fmt: str) -> str:
-    ext_map = {"aac": ".m4a", "m4a": ".m4a", "mp4": ".m4a", "ogg": ".ogg", "opus": ".ogg", "vorbis": ".ogg"}
-    return ext_map.get(fmt.lower(), f".{fmt.lower()}")
+    canonical = canonical_format(fmt)
+    return FORMAT_EXTENSIONS.get(canonical, f".{canonical}")
 
 
 def track_filename(track: Track, number: int, fmt: str = "mp3") -> str:
@@ -434,7 +544,7 @@ def load_config() -> dict:
 
 
 def http_get(url: str, token: str = "", timeout: int = 30) -> bytes:
-    headers = {"User-Agent": f"{APP_NAME}/1.0", "Accept": "application/xml,application/json,text/plain,*/*"}
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/xml,application/json,text/plain,*/*"}
     if token:
         headers["X-Plex-Token"] = token
     request = urllib.request.Request(url, headers=headers)
@@ -753,16 +863,6 @@ def fetch_library_tracks(server: PlexServer, library_key: str, timeout: int) -> 
     return [t for item in root.findall("Track") if (t := track_from_xml(item, server, "Random")) is not None]
 
 
-def unique_tracks(tracks: Iterable[Track]) -> list[Track]:
-    result, seen = [], set()
-    for track in tracks:
-        identity = track.rating_key or f"{track.media_url}|{track.title}|{track.artist}|{track.album}"
-        if identity not in seen:
-            seen.add(identity)
-            result.append(track)
-    return result
-
-
 def choose_directory_limit() -> int:
     print("\nDirectory limit\n  - Maximum 255 audio files per directory.\n  - Enter -1 for unlimited.\n")
     while True:
@@ -781,50 +881,38 @@ def get_format_from_spec(spec: str) -> str:
 
 
 def get_track_format(track: Track) -> str:
-    container = (track.container or "").casefold()
-    codec = (track.audio_codec or "").casefold()
-    url_lower = track.media_url.casefold().split("?", 1)[0]
-    
-    if container in ("mp3", "mpeg") or codec == "mp3" or url_lower.endswith(".mp3"):
-        return "mp3"
-    if container in ("aac", "m4a", "mp4") or codec in ("aac", "mp4a") or url_lower.endswith((".aac", ".m4a", ".mp4")):
-        return "aac"
-    if container == "flac" or codec == "flac" or url_lower.endswith(".flac"):
-        return "flac"
-    if container in ("ogg", "oga") or codec in ("ogg", "vorbis", "opus") or url_lower.endswith((".ogg", ".opus")):
-        return "ogg"
-    return container or codec or "mp3"
+    """Canonical source format, trusting the container first, then the codec, then the URL."""
+    url_extension = track.media_url.casefold().split("?", 1)[0].rpartition(".")[2]
+    for candidate in (track.container, track.audio_codec, url_extension):
+        canonical = canonical_format(candidate)
+        if canonical in KNOWN_FORMATS:
+            return canonical
+    return canonical_format(track.container) or canonical_format(track.audio_codec) or "mp3"
 
 
 def source_matches_output(track: Track, output_format: str) -> bool:
-    output_format = output_format.lower()
-    container, codec = (track.container or "").casefold(), (track.audio_codec or "").casefold()
-    url_lower = track.media_url.casefold().split("?", 1)[0]
-    
-    if output_format == "mp3":
-        return container in ("mp3", "mpeg") or codec == "mp3" or url_lower.endswith(".mp3")
-    if output_format in ("aac", "m4a"):
-        return container in ("aac", "m4a", "mp4") or codec in ("aac", "mp4a") or url_lower.endswith((".aac", ".m4a", ".mp4"))
-    return container == output_format or codec == output_format
+    return get_track_format(track) == canonical_format(output_format)
 
 
 def is_format_supported(track: Track, conversion_formats: list[str]) -> bool:
-    track_fmt = get_track_format(track)
-    return any(
-        track_fmt == get_format_from_spec(spec) or source_matches_output(track, get_format_from_spec(spec))
-        for spec in conversion_formats
-    )
+    track_format = get_track_format(track)
+    return any(track_format == canonical_format(get_format_from_spec(spec)) for spec in conversion_formats)
 
 
-def build_output_path(root: Path, playlist_name: str, position: int, track: Track, directory_limit: int, conversion_formats: list[str]) -> Path:
-    playlist_root = root / sanitize_filename(playlist_name, "Music")
-    if directory_limit == -1:
+def build_output_path(options: ExportOptions, playlist_name: str, position: int, track: Track) -> Path:
+    playlist_root = options.output_root / sanitize_filename(playlist_name, "Music")
+    limit = options.directory_limit
+    if limit == -1:
         directory, directory_position = playlist_root, position
     else:
-        directory = playlist_root / f"{((position - 1) // directory_limit) + 1:03d}"
-        directory_position = ((position - 1) % directory_limit) + 1
+        directory = playlist_root / f"{((position - 1) // limit) + 1:03d}"
+        directory_position = ((position - 1) % limit) + 1
 
-    fmt = get_track_format(track) if is_format_supported(track, conversion_formats) else get_format_from_spec(conversion_formats[0])
+    fmt = (
+        get_track_format(track)
+        if is_format_supported(track, options.conversion_formats)
+        else get_format_from_spec(options.conversion_formats[0])
+    )
     return directory / track_filename(track, directory_position, fmt)
 
 
@@ -835,7 +923,7 @@ def conversion_spec(config: dict) -> tuple[str, str]:
     spec = str(formats[0]).strip()
     parts = spec.split(":", 1)
     output_format, quality = parts[0].strip().lower(), parts[1].strip() if len(parts) == 2 else ""
-    if not re.fullmatch(r"[a-z0-9._+-]+", output_format):
+    if not FORMAT_NAME_PATTERN.fullmatch(output_format):
         raise RuntimeError(f"Invalid conversion format: {spec}")
     return output_format, quality
 
@@ -853,6 +941,7 @@ def conversion_threads(config: dict) -> int:
     raise RuntimeError('audio.conversion_threads must be "auto" or a positive integer.')
 
 
+@functools.lru_cache(maxsize=None)
 def check_program(program: str) -> bool:
     try:
         return subprocess.run([program, "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0
@@ -865,15 +954,13 @@ def ensure_ffmpeg() -> None:
         raise RuntimeError("ffmpeg and ffprobe are required for conversion but were not found in PATH.")
 
 
+@functools.lru_cache(maxsize=1)
 def has_libfdk_aac() -> bool:
-    global _HAS_FDK_AAC
-    if _HAS_FDK_AAC is None:
-        try:
-            res = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-            _HAS_FDK_AAC = "libfdk_aac" in res.stdout
-        except OSError:
-            _HAS_FDK_AAC = False
-    return _HAS_FDK_AAC
+    try:
+        probe = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False)
+    except OSError:
+        return False
+    return "libfdk_aac" in probe.stdout
 
 
 def track_identity(track: Track) -> str:
@@ -885,14 +972,12 @@ def track_identity(track: Track) -> str:
 
 
 def parse_file_identity(path: Path) -> str | None:
-    parts = path.stem.split(" - ", 3)
+    parts = [segment.strip() for segment in path.stem.split(" - ", 3)]
     if len(parts) == 4:
-        _, artist, album, title = parts
-        return "|".join((artist.casefold().strip(), album.casefold().strip(), title.casefold().strip()))
-    elif len(parts) == 3:
-        artist, album, title = parts
-        return "|".join((artist.casefold().strip(), album.casefold().strip(), title.casefold().strip()))
-    return None
+        parts = parts[1:]
+    elif len(parts) != 3:
+        return None
+    return "|".join(segment.casefold() for segment in parts)
 
 
 def verify_track_duration(temp_path: Path, track: Track) -> None:
@@ -902,51 +987,56 @@ def verify_track_duration(temp_path: Path, track: Track) -> None:
 
     expected_seconds = track.duration_ms / 1000.0
     try:
-        res = subprocess.run(
+        probe = subprocess.run(
             [
                 "ffprobe", "-v", "error",
                 "-show_entries", "format=duration",
                 "-of", "default=noprint_wrappers=1:nokey=1",
-                str(temp_path)
+                str(temp_path),
             ],
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             text=True,
-            check=False
+            check=False,
         )
-        if res.returncode == 0 and res.stdout.strip():
-            actual_seconds = float(res.stdout.strip())
-            if actual_seconds < (expected_seconds - DURATION_TOLERANCE_SECONDS):
-                raise RuntimeError(
-                    f"File truncated: expected ~{expected_seconds:.1f}s, got {actual_seconds:.1f}s."
-                )
-    except (ValueError, OSError) as exc:
-        if isinstance(exc, RuntimeError):
-            raise
-        # Fall back gracefully if ffprobe probe fails on non-audio/corrupt output streams
-        pass
+        actual_seconds = float(probe.stdout.strip()) if probe.returncode == 0 else 0.0
+    except (OSError, ValueError):
+        return  # An unreadable probe is not evidence of truncation; accept the file.
+
+    if actual_seconds and actual_seconds < (expected_seconds - DURATION_TOLERANCE_SECONDS):
+        raise RuntimeError(f"File truncated: expected ~{expected_seconds:.1f}s, got {actual_seconds:.1f}s.")
 
 
-def cleanup_playlist_leftovers(output_root: Path, playlist_name: str, tracks: list[Track], directory_limit: int, conversion_formats: list[str]) -> None:
-    playlist_root = output_root / sanitize_filename(playlist_name, "Music")
+def iter_audio_files(root: Path) -> Iterator[Path]:
+    """Yield audio files under root, testing the cheap suffix before touching the filesystem."""
+    for path in root.rglob("*.*"):
+        if path.suffix.lower() in AUDIO_EXTENSIONS and path.is_file():
+            yield path
+
+
+def prune_empty_dirs(root: Path) -> None:
+    for dirpath, _, _ in os.walk(root, topdown=False):
+        directory = Path(dirpath)
+        if directory != root and not any(directory.iterdir()):
+            with contextlib.suppress(OSError):
+                directory.rmdir()
+
+
+def cleanup_playlist_leftovers(options: ExportOptions, playlist_name: str, tracks: list[Track]) -> None:
+    playlist_root = options.output_root / sanitize_filename(playlist_name, "Music")
     if not playlist_root.exists():
         return
 
     expected_paths = {
-        build_output_path(output_root, playlist_name, i, t, directory_limit, conversion_formats).resolve()
-        for i, t in enumerate(tracks, 1)
+        build_output_path(options, playlist_name, position, track)
+        for position, track in enumerate(tracks, 1)
     }
 
-    for path in playlist_root.rglob("*.*"):
-        if path.is_file() and path.suffix.lower() in (".mp3", ".m4a", ".aac", ".flac", ".ogg"):
-            if path.resolve() not in expected_paths:
-                unlink_quiet(path)
+    for path in iter_audio_files(playlist_root):
+        if path not in expected_paths:
+            unlink_quiet(path)
 
-    for dirpath, _, _ in os.walk(playlist_root, topdown=False):
-        d = Path(dirpath)
-        if d != playlist_root and not any(d.iterdir()):
-            with contextlib.suppress(OSError):
-                d.rmdir()
+    prune_empty_dirs(playlist_root)
 
 
 def cleanup_random_fill_leftovers(
@@ -963,43 +1053,37 @@ def cleanup_random_fill_leftovers(
     if excluded_identities:
         valid_keys -= excluded_identities
 
-    existing_files: list[tuple[Path, str, float]] = []
-    for path in random_root.rglob("*.*"):
-        if path.is_file() and path.suffix.lower() in (".mp3", ".m4a", ".aac", ".flac", ".ogg"):
-            key = parse_file_identity(path)
-            if not key or key not in valid_keys:
-                unlink_quiet(path)
-            else:
-                try:
-                    mtime = path.stat().st_mtime
-                except OSError:
-                    mtime = 0.0
-                existing_files.append((path, key, mtime))
+    existing_files: list[tuple[Path, float]] = []
+    for path in iter_audio_files(random_root):
+        key = parse_file_identity(path)
+        if not key or key not in valid_keys:
+            unlink_quiet(path)
+            continue
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        existing_files.append((path, mtime))
 
     if max_random_tracks > 0 and len(existing_files) > max_random_tracks:
-        existing_files.sort(key=lambda x: x[2])
-        excess = len(existing_files) - max_random_tracks
-        for path, _, _ in existing_files[:excess]:
+        existing_files.sort(key=lambda entry: entry[1])
+        for path, _ in existing_files[: len(existing_files) - max_random_tracks]:
             unlink_quiet(path)
 
-    for dirpath, _, _ in os.walk(random_root, topdown=False):
-        d = Path(dirpath)
-        if d != random_root and not any(d.iterdir()):
-            with contextlib.suppress(OSError):
-                d.rmdir()
+    prune_empty_dirs(random_root)
 
 
 def get_existing_random_identities_and_count(output_root: Path) -> tuple[set[str], int]:
     random_root = output_root / "Random"
-    existing_keys = set()
+    if not random_root.exists():
+        return set(), 0
+
+    existing_keys: set[str] = set()
     count = 0
-    if random_root.exists():
-        for path in random_root.rglob("*.*"):
-            if path.is_file() and path.suffix.lower() in (".mp3", ".m4a", ".aac", ".flac", ".ogg"):
-                count += 1
-                key = parse_file_identity(path)
-                if key:
-                    existing_keys.add(key)
+    for path in iter_audio_files(random_root):
+        count += 1
+        if key := parse_file_identity(path):
+            existing_keys.add(key)
     return existing_keys, count
 
 
@@ -1051,14 +1135,14 @@ def ffmpeg_command(track: Track, output: Path, token: str, output_format: str, q
     if output_format in ("aac", "m4a"):
         if has_libfdk_aac():
             cmd.extend(["-c:a", "libfdk_aac"])
-            cmd.extend(["-b:a", norm_q.lower()] if re.fullmatch(r"[0-9]+K", norm_q) else ["-vbr", "5"])
+            cmd.extend(["-b:a", norm_q.lower()] if BITRATE_PATTERN.fullmatch(norm_q) else ["-vbr", "5"])
         else:
-            bitrate = norm_q.lower() if re.fullmatch(r"[0-9]+K", norm_q) else "320k"
+            bitrate = norm_q.lower() if BITRATE_PATTERN.fullmatch(norm_q) else "320k"
             cmd.extend(["-c:a", "aac", "-b:a", bitrate])
         cmd.extend(["-f", "mp4"])
     elif output_format == "mp3":
         cmd.extend(["-map", "0:v?", "-c:v", "copy", "-id3v2_version", "3", "-c:a", "libmp3lame"])
-        cmd.extend(["-b:a", norm_q.lower()] if re.fullmatch(r"[0-9]+K", norm_q) else ["-q:a", "0"])
+        cmd.extend(["-b:a", norm_q.lower()] if BITRATE_PATTERN.fullmatch(norm_q) else ["-q:a", "0"])
         cmd.extend(["-f", "mp3"])
     elif output_format == "flac":
         cmd.extend(["-c:a", "flac", "-f", "flac"])
@@ -1066,150 +1150,152 @@ def ffmpeg_command(track: Track, output: Path, token: str, output_format: str, q
         codec = "libopus" if output_format == "opus" else "libvorbis"
         cmd.extend(["-c:a", codec, "-f", "ogg"])
     else:
-        cmd.extend(["-c:a", "copy"])
+        # The .part suffix hides the real extension, so the muxer must be named explicitly.
+        cmd.extend(["-c:a", "copy", "-f", output_format])
 
     cmd.append(str(output))
     return cmd
 
 
+def _finalize_part(job: DownloadJob, temp_path: Path, written: int, expected: int = 0) -> int:
+    """Validate a finished .part file and atomically promote it to its destination."""
+    if written == 0:
+        unlink_quiet(temp_path)
+        raise RuntimeError("Downloaded file is empty.")
+
+    if expected > 0 and written != expected:
+        unlink_quiet(temp_path)
+        raise RuntimeError(f"Download truncated: expected {expected:,} bytes, got {written:,} bytes.")
+
+    try:
+        verify_track_duration(temp_path, job.track)
+    except RuntimeError:
+        unlink_quiet(temp_path)  # Discard so a retry refetches instead of resuming bad bytes.
+        raise
+
+    os.replace(temp_path, job.destination)
+    return written
+
+
 def download_direct(job: DownloadJob, token: str, timeout: int = 30) -> int:
-    temp_path = job.destination.with_suffix(job.destination.suffix + ".part")
+    temp_path = part_path(job.destination)
     job.destination.parent.mkdir(parents=True, exist_ok=True)
 
-    _register_part_file(temp_path)
-    headers = {"User-Agent": f"{APP_NAME}/1.0"}
+    headers = {"User-Agent": USER_AGENT}
     if token:
         headers["X-Plex-Token"] = token
 
+    source_size = job.track.source_size
     existing_size = temp_path.stat().st_size if temp_path.exists() else 0
+    if source_size > 0 and existing_size > source_size:
+        unlink_quiet(temp_path)  # A part longer than the source can only be corrupt.
+        existing_size = 0
     if existing_size > 0:
         headers["Range"] = f"bytes={existing_size}-"
 
-    req = urllib.request.Request(job.track.media_url, headers=headers)
-    bytes_written = existing_size
-
+    _register_part_file(temp_path, existing_size)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            status_code = getattr(response, "status", getattr(response, "code", 200))
-            mode = "ab"
-            if existing_size > 0 and status_code == 200:
-                existing_size = 0
-                bytes_written = 0
-                mode = "wb"
-            elif existing_size == 0 or status_code != 206:
-                mode = "wb"
-                bytes_written = 0
+        request = urllib.request.Request(job.track.media_url, headers=headers)
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status_code = getattr(response, "status", None) or getattr(response, "code", 200)
+            # Anything other than a 206 means the server restarted the stream from zero.
+            resuming = existing_size > 0 and status_code == 206
+            bytes_written = existing_size if resuming else 0
 
-            with temp_path.open(mode) as handle:
-                while chunk := response.read(64 * 1024):
+            with temp_path.open("ab" if resuming else "wb") as handle:
+                while chunk := response.read(DOWNLOAD_CHUNK_BYTES):
                     handle.write(chunk)
                     bytes_written += len(chunk)
+                    _update_part_progress(temp_path, bytes_written)
 
-        if bytes_written == 0:
-            unlink_quiet(temp_path)
-            raise RuntimeError("Downloaded file is empty.")
-
-        if job.track.source_size > 0 and bytes_written != job.track.source_size:
-            unlink_quiet(temp_path)
-            raise RuntimeError(f"Download truncated: expected {job.track.source_size:,} bytes, got {bytes_written:,} bytes.")
-
-        # Ensure complete audio stream and valid duration against metadata
-        verify_track_duration(temp_path, job.track)
-
-        os.replace(temp_path, job.destination)
-        return bytes_written
+        return _finalize_part(job, temp_path, bytes_written, expected=source_size)
     except urllib.error.HTTPError as exc:
-        if exc.code == 416:
-            if temp_path.exists() and job.track.source_size > 0 and temp_path.stat().st_size == job.track.source_size:
-                verify_track_duration(temp_path, job.track)
-                os.replace(temp_path, job.destination)
-                return temp_path.stat().st_size
+        # 416 means the range started at or past EOF: the part already holds the whole file.
+        if exc.code == 416 and source_size > 0 and temp_path.exists() and temp_path.stat().st_size == source_size:
+            return _finalize_part(job, temp_path, source_size, expected=source_size)
         raise
     finally:
         _unregister_part_file(temp_path)
 
 
 def convert_track(job: DownloadJob, token: str, output_format: str, quality: str) -> int:
-    temp_path = job.destination.with_suffix(job.destination.suffix + ".part")
+    temp_path = part_path(job.destination)
     job.destination.parent.mkdir(parents=True, exist_ok=True)
     unlink_quiet(temp_path)
 
-    _register_part_file(temp_path)
-    cmd = ffmpeg_command(job.track, temp_path, token, output_format, quality)
+    _register_part_file(temp_path)  # Size is unknown up front, so it gets polled instead.
+    command = ffmpeg_command(job.track, temp_path, token, output_format, quality)
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         _register_process(proc)
-        _, stderr_data = proc.communicate()
-        _unregister_process(proc)
+        try:
+            _, stderr_data = proc.communicate()
+        finally:
+            _unregister_process(proc)
 
         if proc.returncode != 0 or not temp_path.exists() or temp_path.stat().st_size == 0:
             unlink_quiet(temp_path)
-            err = stderr_data.strip() if stderr_data else "FFmpeg conversion failed"
-            raise RuntimeError(err)
+            raise RuntimeError((stderr_data or "").strip() or "FFmpeg conversion failed")
 
-        # Validate that the transcoded output file meets expected media duration
-        verify_track_duration(temp_path, job.track)
-
-        bytes_written = temp_path.stat().st_size
-        os.replace(temp_path, job.destination)
-        return bytes_written
+        return _finalize_part(job, temp_path, temp_path.stat().st_size)
     finally:
         _unregister_part_file(temp_path)
 
 
-def download_track(
-    job: DownloadJob,
-    token: str,
-    output_format: str,
-    quality: str,
-    retries: int = 3,
-    retry_delay: float = 2.0,
-) -> DownloadResult:
-    is_direct = source_matches_output(job.track, output_format)
+def _reuse_existing(job: DownloadJob, is_direct: bool) -> bool:
+    """Report whether the destination already holds a usable file, deleting it if not."""
+    if not job.destination.exists():
+        return False
 
-    if job.destination.exists():
-        dest_size = job.destination.stat().st_size
-        if is_direct and job.track.source_size > 0:
-            if dest_size == job.track.source_size:
-                return DownloadResult(job=job, success=True, skipped=True, bytes_written=0, elapsed=0.0, attempts=0)
-            else:
-                # Truncated or mismatched file from previous interrupted run; discard and re-download
-                unlink_quiet(job.destination)
-        elif dest_size > 0:
-            return DownloadResult(job=job, success=True, skipped=True, bytes_written=0, elapsed=0.0, attempts=0)
+    # Only direct copies have a known exact size to validate an interrupted run against.
+    if is_direct and job.track.source_size > 0:
+        if job.destination.stat().st_size == job.track.source_size:
+            return True
+        unlink_quiet(job.destination)
+        return False
+
+    return job.destination.stat().st_size > 0
+
+
+def download_track(job: DownloadJob, token: str, options: ExportOptions) -> DownloadResult:
+    # Direct-copy when the source is already in a configured format; this must
+    # mirror build_output_path's format choice so the .part/resume path is used
+    # for every supported format, not only the top-priority one.
+    is_direct = is_format_supported(job.track, options.conversion_formats)
+
+    if _reuse_existing(job, is_direct):
+        return DownloadResult(job=job, success=True, skipped=True, bytes_written=0, elapsed=0.0, attempts=0)
 
     start_time = time.monotonic()
     last_error = ""
 
-    for attempt in range(1, retries + 1):
+    for attempt in range(1, options.retries + 1):
         try:
-            if is_direct:
-                bytes_written = download_direct(job, token)
-            else:
-                bytes_written = convert_track(job, token, output_format, quality)
-
-            elapsed = max(0.001, time.monotonic() - start_time)
+            bytes_written = (
+                download_direct(job, token)
+                if is_direct
+                else convert_track(job, token, options.output_format, options.quality)
+            )
             return DownloadResult(
                 job=job,
                 success=True,
                 skipped=False,
                 bytes_written=bytes_written,
-                elapsed=elapsed,
+                elapsed=max(0.001, time.monotonic() - start_time),
                 attempts=attempt,
             )
         except Exception as exc:
             last_error = str(exc)
-            if attempt < retries:
-                time.sleep(retry_delay * attempt)
+            if attempt < options.retries:
+                time.sleep(options.retry_delay * attempt)
 
-    elapsed = max(0.001, time.monotonic() - start_time)
     return DownloadResult(
         job=job,
         success=False,
         skipped=False,
         bytes_written=0,
-        elapsed=elapsed,
-        attempts=retries,
+        elapsed=max(0.001, time.monotonic() - start_time),
+        attempts=options.retries,
         error=last_error,
     )
 
@@ -1217,26 +1303,23 @@ def download_track(
 def render_progress_bar(completed: int, total: int, width: int = 20) -> str:
     if total <= 0:
         return " " * width
-    filled_len = int(round(width * completed / total))
-    filled_len = max(0, min(width, filled_len))
-    bar = "█" * filled_len + "░" * (width - filled_len)
-    return bar
+    filled = max(0, min(width, int(round(width * completed / total))))
+    return "█" * filled + "░" * (width - filled)
 
 
 def process_download_queue(
     jobs: list[DownloadJob],
     token: str,
-    output_format: str,
-    quality: str,
-    max_workers: int,
-    retries: int,
-    retry_delay: float,
-    reserve_bytes: int = 0,
+    options: ExportOptions,
+    *,
     is_random_fill: bool = False,
-    output_root: Path | None = None,
 ) -> tuple[list[DownloadResult], bool]:
     if not jobs:
         return [], False
+
+    max_workers = options.max_workers
+    reserve_bytes = options.reserve_bytes
+    output_root = options.output_root
 
     adaptive = AdaptiveConcurrency(max_workers)
     results: list[DownloadResult] = []
@@ -1258,17 +1341,22 @@ def process_download_queue(
         with active_lock:
             active_jobs_map[thread_id] = track_desc
         try:
-            return download_track(j, token, output_format, quality, retries, retry_delay)
+            return download_track(j, token, options)
         finally:
             with active_lock:
                 active_jobs_map.pop(thread_id, None)
 
     print_lock = threading.Lock()
-    
+
     last_render_time = time.monotonic()
+    last_scan_time = 0.0
     last_total_bytes = 0
+    scanned_active_bytes = 0
+    scanned_free_space = 0
     ewma_rate = 0.0
     min_render_interval = 0.04
+    scan_interval = 0.1
+    projecting = is_random_fill and reserve_bytes > 0
 
     with print_lock:
         sys.stdout.write("\n\n")
@@ -1276,71 +1364,60 @@ def process_download_queue(
         sys.stdout.write("\033[s")
         sys.stdout.flush()
 
+    def _average_track_bytes() -> float:
+        downloaded_count = completed - skipped_count
+        if downloaded_count > 0 and total_bytes > 0:
+            return total_bytes / downloaded_count
+        sample = jobs[:10]
+        estimate = sum(j.track.source_size for j in sample) / len(sample) if sample else 0
+        return estimate or 8 * 1024 * 1024
+
+    def _format_eta(seconds: float) -> str:
+        return human_duration(int(seconds * 1000))
+
     def render_progress(force: bool = False) -> None:
-        nonlocal last_render_time, last_total_bytes, ewma_rate
+        nonlocal last_render_time, last_scan_time, last_total_bytes
+        nonlocal scanned_active_bytes, scanned_free_space, ewma_rate
+
         now = time.monotonic()
         dt = now - last_render_time
         if not force and dt < min_render_interval:
             return
 
-        active_bytes = 0
-        with TRACK_LOCK:
-            active_paths = list(ACTIVE_PART_FILES)
-        for p in active_paths:
-            try:
-                active_bytes += p.stat().st_size
-            except OSError:
-                pass
+        # Filesystem probes are far costlier than a repaint, so they run on a slower cadence.
+        if force or now - last_scan_time >= scan_interval:
+            scanned_active_bytes = active_part_bytes()
+            scanned_free_space = free_space(output_root) if projecting else 0
+            last_scan_time = now
 
-        current_total = total_bytes + active_bytes
+        current_total = total_bytes + scanned_active_bytes
 
-        if dt >= 0.1:
+        if dt >= scan_interval:
             delta = current_total - last_total_bytes
             if delta >= 0:
-                inst_rate = delta / dt
-                ewma_rate = 0.2 * inst_rate + 0.8 * ewma_rate
+                ewma_rate = 0.2 * (delta / dt) + 0.8 * ewma_rate
                 last_total_bytes = current_total
             last_render_time = now
 
-        elapsed = max(0.001, time.monotonic() - start_time)
+        elapsed = max(0.001, now - start_time)
+        free_above_reserve = max(0, scanned_free_space - reserve_bytes) if projecting else 0
 
-        current_free = free_space(output_root) if (is_random_fill and output_root) else 0
-        free_above_reserve = max(0, current_free - reserve_bytes) if (is_random_fill and reserve_bytes > 0) else 0
-
+        # Random fill runs until the disk reserve is hit, so its total is a moving projection.
         display_total = total
-        if is_random_fill and reserve_bytes > 0 and output_root:
-            downloaded_count = completed - skipped_count
-            avg_track_bytes = (total_bytes / downloaded_count) if downloaded_count > 0 else (
-                sum(j.track.source_size for j in jobs[:10]) / min(10, len(jobs)) if jobs else 8 * 1024 * 1024
-            )
-            if avg_track_bytes <= 0:
-                avg_track_bytes = 8 * 1024 * 1024
-            
-            estimated_remaining = int(free_above_reserve / avg_track_bytes)
+        if projecting:
+            estimated_remaining = int(free_above_reserve / _average_track_bytes())
             display_total = max(completed, min(len(jobs), completed + estimated_remaining))
 
         pct = (completed / display_total) * 100 if display_total > 0 else 0
 
         eta_str = "unknown"
-        if is_random_fill and reserve_bytes > 0 and output_root:
-            if ewma_rate > 0 and free_above_reserve > 0:
-                eta_secs = free_above_reserve / ewma_rate
-                eta_str = human_duration(int(eta_secs * 1000))
-            elif ewma_rate > 0 and completed > 0:
-                remaining_jobs = display_total - completed
-                eta_secs = remaining_jobs * (elapsed / completed)
-                eta_str = human_duration(int(eta_secs * 1000))
-        else:
-            if ewma_rate > 0 and completed > 0:
-                remaining_jobs = total - completed
-                eta_secs = remaining_jobs * (elapsed / completed)
-                eta_str = human_duration(int(eta_secs * 1000))
+        if projecting and ewma_rate > 0 and free_above_reserve > 0:
+            eta_str = _format_eta(free_above_reserve / ewma_rate)
+        elif ewma_rate > 0 and completed > 0:
+            eta_str = _format_eta((display_total - completed) * (elapsed / completed))
 
-        term_width = shutil.get_terminal_size((80, 24)).columns
-        safe_width = max(10, term_width - 2)
-
-        bar_width = 12 if safe_width < 60 else 20
-        bar_str = render_progress_bar(completed, display_total, width=bar_width)
+        safe_width = max(10, terminal_width() - 2)
+        bar_str = render_progress_bar(completed, display_total, width=12 if safe_width < 60 else 20)
         skip_str = f" ({skipped_count:,} skip)" if skipped_count > 0 else ""
 
         with active_lock:
@@ -1349,23 +1426,14 @@ def process_download_queue(
         line1_raw = f" {bar_str} {pct:5.1f}% {completed}/{display_total}{skip_str} | {human_size(current_total)} | {human_rate(ewma_rate)} | ETA: {eta_str}"
         line1 = pad_right(truncate_to_width(line1_raw, safe_width), safe_width)
 
+        line2 = ""
         if current_active:
-            if len(current_active) > 3:
-                active_desc = "; ".join(current_active[:3]) + "…"
-            else:
-                active_desc = "; ".join(current_active)
-            line2_raw = f"Active: {active_desc}"
-            line2 = pad_right(truncate_to_width(line2_raw, safe_width), safe_width)
-            has_active = True
-        else:
-            has_active = False
+            active_desc = "; ".join(current_active[:3]) + ("…" if len(current_active) > 3 else "")
+            line2 = pad_right(truncate_to_width(f"Active: {active_desc}", safe_width), safe_width)
 
         with print_lock:
             sys.stdout.write("\033[u")
-            if has_active:
-                sys.stdout.write(f"\033[K{line1}\n\033[K{line2}")
-            else:
-                sys.stdout.write(f"\033[K{line1}\n\033[K")
+            sys.stdout.write(f"\033[K{line1}\n\033[K{line2}")
             sys.stdout.flush()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1380,29 +1448,26 @@ def process_download_queue(
                 return False
 
             if reserve_bytes > 0:
-                current_free = free_space(job.destination.parent)
-                
-                with TRACK_LOCK:
-                    active_buffer = len(ACTIVE_PART_FILES) * (4 * 1024 * 1024)
-                
-                expected_size = job.track.source_size if job.track.source_size > 0 else (8 * 1024 * 1024)
-                
-                if (current_free - active_buffer - expected_size) <= reserve_bytes:
+                # In-flight parts have not landed on disk yet; hold back a slot for each.
+                active_buffer = active_part_count() * (4 * 1024 * 1024)
+                expected_size = job.track.source_size or (8 * 1024 * 1024)
+                if (free_space(job.destination.parent) - active_buffer - expected_size) <= reserve_bytes:
                     stopped_on_reserve = True
                     return False
 
-            fut = executor.submit(_execute_job, job)
-            futures[fut] = job
+            futures[executor.submit(_execute_job, job)] = job
             return True
 
-        for _ in range(max_workers):
-            if not _submit_next():
-                break
+        def _fill_slots() -> None:
+            while not stopped_on_reserve and len(futures) < adaptive.workers and _submit_next():
+                pass
+
+        _fill_slots()
 
         while futures:
             done, _ = concurrent.futures.wait(futures.keys(), timeout=0.05, return_when=concurrent.futures.FIRST_COMPLETED)
             if not done:
-                render_progress() 
+                render_progress()
                 continue
 
             for fut in done:
@@ -1419,10 +1484,8 @@ def process_download_queue(
                 else:
                     adaptive.failure()
 
-                render_progress()
-
-                if not stopped_on_reserve:
-                    _submit_next()
+            render_progress()
+            _fill_slots()
 
     render_progress(force=True)
 
@@ -1434,115 +1497,80 @@ def process_download_queue(
     return results, stopped_on_reserve
 
 
-def main() -> None:
-    print(f"=== {APP_NAME} ===")
-    config = load_config()
-
-    ensure_ffmpeg()
-
+def connect_to_plex(config: dict) -> tuple[PlexServer, int]:
     print("\n--- Plex Connection ---")
     server = prompt_server(config, CONFIG_PATH)
     user = prompt_user(server, config, CONFIG_PATH)
-    server = PlexServer(
-        name=server.name,
-        host=server.host,
-        port=server.port,
-        protocol=server.protocol,
-        token=server.token,
-        user=user,
-    )
+    server = replace(server, user=user)
+    return server, safe_int(config["plex"].get("timeout"), 30)
 
-    timeout = safe_int(config["plex"].get("timeout"), 30)
 
-    print("\n--- Music Library ---")
-    library_key, library_title = select_music_library(server, timeout=timeout)
-    print(f"  Selected: {library_title}\n")
-
-    playlists = get_playlists(server, timeout=timeout)
-    output_root = Path(config["output"].get("directory", DOWNLOAD_DIR)).resolve()
-    selected_playlists = choose_playlists(playlists, output_root)
-
-    directory_limit = safe_int(config["output"].get("directory_limit"), 255)
-    if directory_limit not in (-1, 255):
-        directory_limit = choose_directory_limit()
-
-    reserve_setting = config["output"].get("reserve", "5%")
-    _, _, reserve_bytes = get_disk_stats(output_root, reserve_setting)
-
-    output_format, quality = conversion_spec(config)
-    conversion_formats = config["audio"].get("conversion_formats", ["aac:vbr"])
-    max_workers = conversion_threads(config)
-    retries = safe_int(config["download"].get("retries"), 3)
-    retry_delay = safe_float(config["download"].get("retry_delay"), 2.0)
-
-    random_config = config.get("random", {})
-    max_random_tracks = safe_int(random_config.get("max_tracks"), 1000)
-    random_strategy = str(random_config.get("strategy", "freshness"))
-
-    all_jobs: list[DownloadJob] = []
+def build_playlist_jobs(
+    server: PlexServer,
+    selected_playlists: list[tuple[str, str]],
+    options: ExportOptions,
+    timeout: int,
+) -> tuple[list[DownloadJob], bool]:
+    jobs: list[DownloadJob] = []
     has_random = False
 
-    for rk, title in selected_playlists:
-        if rk == "Random":
+    for rating_key, title in selected_playlists:
+        if rating_key == "Random":
             has_random = True
             continue
 
         term_print(f"Fetching tracks for playlist: {title}…")
-        tracks = fetch_playlist_tracks(server, rk, timeout=timeout)
-        cleanup_playlist_leftovers(output_root, title, tracks, directory_limit, conversion_formats)
+        tracks = fetch_playlist_tracks(server, rating_key, timeout=timeout)
+        cleanup_playlist_leftovers(options, title, tracks)
 
-        for idx, track in enumerate(tracks, 1):
-            dest = build_output_path(output_root, title, idx, track, directory_limit, conversion_formats)
-            all_jobs.append(DownloadJob(index=idx, total=len(tracks), track=track, destination=dest))
+        jobs.extend(
+            DownloadJob(
+                index=position,
+                total=len(tracks),
+                track=track,
+                destination=build_output_path(options, title, position, track),
+            )
+            for position, track in enumerate(tracks, 1)
+        )
 
-    results, stopped_on_reserve = process_download_queue(
-        all_jobs,
-        token=server.token,
-        output_format=output_format,
-        quality=quality,
-        max_workers=max_workers,
-        retries=retries,
-        retry_delay=retry_delay,
-        reserve_bytes=reserve_bytes,
-        is_random_fill=False,
-        output_root=output_root,
+    return jobs, has_random
+
+
+def build_random_jobs(
+    server: PlexServer,
+    library_key: str,
+    options: ExportOptions,
+    config: dict,
+    timeout: int,
+    excluded_identities: set[str],
+) -> list[DownloadJob]:
+    term_print("\nFetching tracks for library (Random Fill)…")
+    library_tracks = fetch_library_tracks(server, library_key, timeout=timeout)
+
+    random_config = config.get("random", {})
+    candidates, start_position = select_random_tracks(
+        library_tracks,
+        options.output_root,
+        max_random_tracks=safe_int(random_config.get("max_tracks"), 1000),
+        strategy=str(random_config.get("strategy", "freshness")),
+        excluded_identities=excluded_identities,
     )
 
-    if has_random and not stopped_on_reserve:
-        term_print("\nFetching tracks for library (Random Fill)…")
-        lib_tracks = fetch_library_tracks(server, library_key, timeout=timeout)
-        playlist_track_identities = {track_identity(job.track) for job in all_jobs}
+    (options.output_root / "Random").mkdir(parents=True, exist_ok=True)
 
-        random_candidates, start_position = select_random_tracks(
-            lib_tracks, output_root, max_random_tracks=max_random_tracks, strategy=random_strategy, excluded_identities=playlist_track_identities
+    total = len(candidates) + start_position - 1
+    return [
+        DownloadJob(
+            index=position,
+            total=total,
+            track=track,
+            destination=build_output_path(options, "Random", position, track),
         )
-        random_root = output_root / "Random"
-        random_root.mkdir(parents=True, exist_ok=True)
+        for position, track in enumerate(candidates, start_position)
+    ]
 
-        random_jobs: list[DownloadJob] = []
-        position = start_position
-        for track in random_candidates:
-            dest = build_output_path(output_root, "Random", position, track, directory_limit, conversion_formats)
-            random_jobs.append(DownloadJob(index=position, total=len(random_candidates) + start_position - 1, track=track, destination=dest))
-            position += 1
 
-        if random_jobs:
-            rand_results, rand_stopped_reserve = process_download_queue(
-                random_jobs,
-                token=server.token,
-                output_format=output_format,
-                quality=quality,
-                max_workers=max_workers,
-                retries=retries,
-                retry_delay=retry_delay,
-                reserve_bytes=reserve_bytes,
-                is_random_fill=True,
-                output_root=output_root,
-            )
-            results.extend(rand_results)
-            if rand_stopped_reserve:
-                stopped_on_reserve = True
-
+def print_summary(results: list[DownloadResult], options: ExportOptions, stopped_on_reserve: bool) -> None:
     successes = [r for r in results if r.success and not r.skipped]
     skipped = [r for r in results if r.skipped]
     failures = [r for r in results if not r.success]
@@ -1555,10 +1583,51 @@ def main() -> None:
     print(f"  Skipped:            {len(skipped):,} tracks (already present)")
     print(f"  Failed:             {len(failures):,} tracks")
     if stopped_on_reserve:
-        print(f"  Stopped on Reserve: Yes ({reserve_setting} / {human_size(reserve_bytes)} safety limit reached)")
+        print(f"  Stopped on Reserve: Yes ({options.reserve_setting} / {human_size(options.reserve_bytes)} safety limit reached)")
     if total_time > 0:
         print(f"  Total time:         {human_duration(int(total_time * 1000))}")
     print("\nDone.")
+
+
+def main() -> None:
+    print(f"=== {APP_NAME} ===")
+    config = load_config()
+
+    ensure_ffmpeg()
+
+    server, timeout = connect_to_plex(config)
+
+    print("\n--- Music Library ---")
+    library_key, library_title = select_music_library(server, timeout=timeout)
+    print(f"  Selected: {library_title}\n")
+
+    options = ExportOptions.from_config(config)
+    playlists = get_playlists(server, timeout=timeout)
+    selected_playlists = choose_playlists(playlists, options.output_root)
+
+    if options.directory_limit not in (-1, 255):
+        options = replace(options, directory_limit=choose_directory_limit())
+
+    all_jobs, has_random = build_playlist_jobs(server, selected_playlists, options, timeout)
+    results, stopped_on_reserve = process_download_queue(all_jobs, server.token, options)
+
+    if has_random and not stopped_on_reserve:
+        random_jobs = build_random_jobs(
+            server,
+            library_key,
+            options,
+            config,
+            timeout,
+            excluded_identities={track_identity(job.track) for job in all_jobs},
+        )
+        if random_jobs:
+            random_results, random_stopped = process_download_queue(
+                random_jobs, server.token, options, is_random_fill=True
+            )
+            results.extend(random_results)
+            stopped_on_reserve = stopped_on_reserve or random_stopped
+
+    print_summary(results, options, stopped_on_reserve)
 
 
 if __name__ == "__main__":
