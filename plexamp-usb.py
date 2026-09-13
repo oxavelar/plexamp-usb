@@ -895,6 +895,38 @@ def parse_file_identity(path: Path) -> str | None:
     return None
 
 
+def verify_track_duration(temp_path: Path, track: Track) -> None:
+    """Verify audio stream integrity and duration post-download or conversion using ffprobe."""
+    if track.duration_ms <= 0:
+        return
+
+    expected_seconds = track.duration_ms / 1000.0
+    try:
+        res = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(temp_path)
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            actual_seconds = float(res.stdout.strip())
+            if actual_seconds < (expected_seconds - DURATION_TOLERANCE_SECONDS):
+                raise RuntimeError(
+                    f"File truncated: expected ~{expected_seconds:.1f}s, got {actual_seconds:.1f}s."
+                )
+    except (ValueError, OSError) as exc:
+        if isinstance(exc, RuntimeError):
+            raise
+        # Fall back gracefully if ffprobe probe fails on non-audio/corrupt output streams
+        pass
+
+
 def cleanup_playlist_leftovers(output_root: Path, playlist_name: str, tracks: list[Track], directory_limit: int, conversion_formats: list[str]) -> None:
     playlist_root = output_root / sanitize_filename(playlist_name, "Music")
     if not playlist_root.exists():
@@ -1021,7 +1053,7 @@ def ffmpeg_command(track: Track, output: Path, token: str, output_format: str, q
             cmd.extend(["-c:a", "libfdk_aac"])
             cmd.extend(["-b:a", norm_q.lower()] if re.fullmatch(r"[0-9]+K", norm_q) else ["-vbr", "5"])
         else:
-            bitrate = norm_q.lower() if re.fullmatch(r"[0-9]+K", norm_q) else "256k"
+            bitrate = norm_q.lower() if re.fullmatch(r"[0-9]+K", norm_q) else "320k"
             cmd.extend(["-c:a", "aac", "-b:a", bitrate])
         cmd.extend(["-f", "mp4"])
     elif output_format == "mp3":
@@ -1081,11 +1113,15 @@ def download_direct(job: DownloadJob, token: str, timeout: int = 30) -> int:
             unlink_quiet(temp_path)
             raise RuntimeError(f"Download truncated: expected {job.track.source_size:,} bytes, got {bytes_written:,} bytes.")
 
+        # Ensure complete audio stream and valid duration against metadata
+        verify_track_duration(temp_path, job.track)
+
         os.replace(temp_path, job.destination)
         return bytes_written
     except urllib.error.HTTPError as exc:
         if exc.code == 416:
             if temp_path.exists() and job.track.source_size > 0 and temp_path.stat().st_size == job.track.source_size:
+                verify_track_duration(temp_path, job.track)
                 os.replace(temp_path, job.destination)
                 return temp_path.stat().st_size
         raise
@@ -1110,6 +1146,9 @@ def convert_track(job: DownloadJob, token: str, output_format: str, quality: str
             unlink_quiet(temp_path)
             err = stderr_data.strip() if stderr_data else "FFmpeg conversion failed"
             raise RuntimeError(err)
+
+        # Validate that the transcoded output file meets expected media duration
+        verify_track_duration(temp_path, job.track)
 
         bytes_written = temp_path.stat().st_size
         os.replace(temp_path, job.destination)
